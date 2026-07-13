@@ -93,6 +93,8 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action capabil
 
 首次调用必须设置有限的 `maxTurns`、`maxBudgetUsd` 和返回大小，预算应覆盖当前阶段而非整个可能扩张的任务。到达预算约 80%、连续两个实质回合重复读取或重复结论、开始修改范围外文件、擅自删减要求，或预计返工成本已超过 Codex 直接完成时，停止会话并由 Codex 接管；不要因为已有投入而继续追加预算。
 
+预算上限必须根据预计输入 token、缓存读取、工具轮次和输出规模估算，并留出完成最终回答的余量。不要给需要读取长日志或大 transcript 的任务设置无法覆盖首次完整处理的低预算；这类任务优先使用可信的结构化用量工具（如 `ccusage --json`）或本地确定性代码提取、去重并汇总 `input/output/cache creation/cache read`，再让 CC 只判断压缩后的元数据。发生 budget error 或状态异常时，先记录 result subtype、`session_id`、usage、费用和轮次，再用 session metadata 与一次最小 `poll` 取回可复用输出；只有确认无法恢复时才补充调用，禁止不看结果就直接重跑。用量审计必须区分“增加”“减少”和“证据不足”，不得把缺失数据解释为持平。
+
 **Claude Code MCP 轮询**：正常监控使用 `responseMode=minimal` 或 `delta_compact`，`includeActions=true`、`includeResult=true`，并关闭普通 events、progress events、terminal events、structured output 和中间 usage。只有诊断 MCP、hook 或权限协议时才临时打开所需事件，并设置 `maxBytes` / `maxEvents`。不得把模型思考、完整 hook 输出、重复工具事件或整段 transcript 回灌到 Codex 上下文。最终结果过长时让 CC 落盘并仅返回路径、diff 摘要、测试结果和待确认事项。
 
 示例：
