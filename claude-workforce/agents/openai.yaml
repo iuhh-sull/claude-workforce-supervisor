@@ -1,0 +1,4 @@
+interface:
+  display_name: "Claude Workforce"
+  short_description: "Manage persistent Claude Code background workers"
+  default_prompt: "Use $claude-workforce to start and supervise a persistent Claude Code worker."
