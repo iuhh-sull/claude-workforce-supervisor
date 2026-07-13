@@ -2,26 +2,19 @@
 
 > Unofficial project. [中文说明](./README.zh-CN.md)
 
-Manage persistent background Claude Code workers via the official `claude agents` supervisor. Each worker is an independent Claude Code conversation, and Codex (the supervisor) dispatches tasks, checks status, reclaims conversations, and verifies results.
+Claude Workforce lets Codex manage background Claude Code workers through the official `claude agents` supervisor. Codex dispatches work, checks status and logs, and reviews the result. If a task is interrupted, the supervisor can resume its conversation later.
 
-## What problem does it solve
+This unofficial Codex skill wraps the official `agents` subcommand. It is intended for research, code review, and background work completed in stages.
 
-Many Codex-to-Claude integrations are one-shot calls. Once the command ends, the supervisor has no consistent status, log, and resume interface.
-
-Workforce gives Codex a resumable background-session interface. You can inspect logs, stop or restart a worker, and continue the same conversation later. The underlying process does not have to stay alive permanently; the supervisor preserves recoverable state.
-
-## Quick start
+## Install
 
 ```powershell
-# Install to ~/.codex/skills/claude-workforce
 pwsh -NoProfile -File Install.ps1
-
-# Use -Force only to back up and replace an existing installation
 ```
 
-On first install, the script verifies PowerShell 7, checks required package files, and backs up any existing installation before overwriting.
+First install doesn't need `-Force`. Add `-Force` only to overwrite an existing installation; the script backs up the old directory first.
 
-After installation, you can create a private config at `~/.codex/claude-workforce.local.psd1`. It accepts exactly three keys:
+After install you can create a private config at `~/.codex/claude-workforce.local.psd1`. It accepts exactly three keys:
 
 ```powershell
 @{
@@ -33,9 +26,9 @@ After installation, you can create a private config at `~/.codex/claude-workforc
 
 Don't commit this file to a public repository. Precedence: CLI parameters > private file > environment variables > PATH.
 
-## Usage
+## Quick start
 
-Check that your environment is ready:
+Verify the environment:
 
 ```powershell
 $workforce = Join-Path $HOME '.codex\skills\claude-workforce\scripts\claude-workforce.ps1'
@@ -55,53 +48,51 @@ pwsh -NoProfile -File $workforce -Action start -Mode write `
   -Model "deepseek-v4-pro[1m]" -Effort high -Role implementer `
   -Cwd "<git-project-path>" -Prompt "Implement the change and run targeted tests"
 
-# Smoke test (no tools, flash + low)
+# Smoke test (no tools, flash + low to save cost)
 pwsh -NoProfile -File $workforce -Action start -Mode inspect `
   -NoTools -Effort low -Role smoke -Cwd "<project-path>" -Prompt "Reply only WORKFORCE_SMOKE_READY"
 ```
 
-For status, logs, reply, attach, stop, and remove commands, see the full reference in [SKILL.md](./claude-workforce/SKILL.md).
+For status, log, reply, stop, and remove commands, see [SKILL.md](./claude-workforce/SKILL.md).
 
-### Model routing
+## Model routing
 
-Use `flash` + `medium` for retrieval, screening, formatting, smoke tests, and mechanical checks. Switch to `pro` + `high` for deeper diagnostics, security review, architecture decisions, and final acceptance. Reserve `max` for high-risk, multi-constraint tasks.
+Use flash + medium for retrieval, screening, formatting, and smoke tests. Switch to pro + high for deeper diagnostics, security review, and architecture calls. Reserve max for high-risk multi-constraint tasks.
 
-Choosing the right model isn't just a name swap — flash is cheaper and faster for bulk exploration; pro is slower but more reliable for judgment calls.
+Flash is cheap and fast for exploration. Pro is slower but more reliable for judgment.
 
-### Permission model
+## Permissions
 
-**Public search (allow by default):** `WebSearch`, Exa search, Tavily search/research. No confirmation needed.
+Public search (WebSearch, Exa search, Tavily search/research) is allowed by default. No prompt.
 
-**URL fetching (ask by default):** `WebFetch`, Exa fetch, Tavily extract/crawl/map, context-mode fetch. Each request goes through you. If you trust your environment, set `AllowBroadWebFetch = $true` in the private config to move these from ask to allow.
+URL fetching (WebFetch, Exa fetch, Tavily extract/crawl/map, context-mode fetch) prompts by default. Set `AllowBroadWebFetch = $true` in the private config to skip the prompt if you trust your environment.
 
-**Side-effecting tools (ask):** `Bash`, `Edit`, `Write`, `NotebookEdit` always prompt for confirmation.
+Bash, Edit, Write, NotebookEdit always prompt.
 
-**Credential stores (deny):** `.env`, `.ssh`, `.aws`, auth files, private keys, `.npmrc`, `.pypirc`, `.netrc`, `.docker/config.json`, `gh` config, and any `*credentials.json` / `*secrets.yaml` / `*.pem` / `*.key` — workers are blocked from reading, editing, or writing these paths.
+Credential stores (.env, .ssh, .aws, auth files, private keys, .npmrc, .pypirc, .netrc, .docker/config.json, gh config, `*credentials.json`, `*secrets.yaml`, `*.pem`, `*.key`) are blocked from read, edit, and write.
 
-**Global configuration:** Workers may read but must not modify the user's global configuration. If they encounter secret values, they must not echo or transmit them.
+Global config: workers can read but not modify. If they encounter secrets, they must not echo or transmit them.
 
-**Nested agents (deny → ask):** `Agent` is denied by default. Pass `-AllowNestedAgents` to move it from deny to ask — each nested agent request then prompts you. Don't enable this unless you have explicitly approved the additional parallelism and cost.
+Nested agents are denied by default. Pass `-AllowNestedAgents` to change to ask-per-use. Don't enable unless you need the parallelism.
 
-### Windows security note
+## Windows note
 
-Native Windows does not provide a full OS sandbox for Claude Code. Permission deny rules enforce constraints at the tool level, but they don't prevent file reads or process execution at the OS level. Don't rely on this as a security sandbox.
+Native Windows doesn't provide a full OS sandbox for Claude Code. Permission deny rules enforce at the tool level, not at the OS level. Don't rely on this for sandboxing.
 
-### Remove requires dual confirmation
+## Remove a worker
 
 ```powershell
 pwsh -NoProfile -File $workforce -Action remove -Id "<id>" `
   -ConfirmRemove -CheckedWorktree
 ```
 
-`-ConfirmRemove` confirms you intend to delete. `-CheckedWorktree` confirms you've reviewed the worker status, logs, and any associated worktree for uncommitted changes. Both are required.
-
-Only workers in terminal states (`stopped`, `completed`, `failed`, `error`, `dead`, `cancelled`, `exited`) can be removed. Stop a running worker first.
+`-ConfirmRemove` confirms the deletion. `-CheckedWorktree` confirms that you reviewed the worker status, logs, and associated worktree for uncommitted or unmerged changes. Both are required. Only terminal states (stopped, completed, failed, error, dead, cancelled, exited) can be removed; stop a running worker first.
 
 ## Project layout
 
 ```
 claude-workforce/
-  SKILL.md                 # Codex skill definition, full reference
+  SKILL.md                 # Codex skill definition
   agents/openai.yaml       # OpenAI-compatible agent definition
   scripts/
     claude-workforce.ps1   # Core wrapper
@@ -112,10 +103,6 @@ README.md                  # This file
 README.zh-CN.md            # Chinese translation
 SECURITY.md                # Security policy
 ```
-
-## How it differs
-
-This is not a one-shot `claude -p` invocation: worker conversations remain resumable even when a process exits. It is an unofficial Codex skill around the official `agents` subcommand, not an MCP proxy or standalone CI/CD runner. Codex still dispatches tasks and verifies results.
 
 ## Uninstall
 
