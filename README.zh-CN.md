@@ -14,17 +14,20 @@ pwsh -NoProfile -File Install.ps1
 
 首次安装不加 `-Force`。升级或替换已有安装时才加 `-Force`，安装器会先备份旧目录。
 
-装完可以建私有配置文件 `~/.codex/claude-workforce.local.psd1`，只接受这三个键：
+装完可以建私有配置文件 `~/.codex/claude-workforce.local.psd1`，只接受这四个键：
 
 ```powershell
 @{
     ClaudeExecutable   = "C:\path\to\claude.exe"
     ExpectedClaudeSha256 = "<64位十六进制哈希>"
     AllowBroadWebFetch = $true
+    EnableToolSearch = $true
 }
 ```
 
 不要提交到公开仓库。优先级：命令行参数 > 私有文件 > 环境变量 > PATH。
+
+`EnableToolSearch` 只在 `-ContextProfile full` 下生效，因为其他档位不会继承 MCP；加了 `-NoTools` 时则始终关闭。
 
 ## 快速开始
 
@@ -35,7 +38,23 @@ $workforce = Join-Path $HOME '.codex\skills\claude-workforce\scripts\claude-work
 pwsh -NoProfile -File $workforce -Action capabilities
 ```
 
-启动员工：
+一次性任务优先用有硬预算的 `run`：
+
+```powershell
+# 纯文本/数字判断：最小上下文、无工具，成功后不留会话
+pwsh -NoProfile -File $workforce -Action run -Mode inspect -NoTools -Ephemeral `
+  -ContextProfile minimal -MaxTurns 1 -MaxBudgetUsd 1 `
+  -Model "deepseek-v4-flash[1m]" -Effort low `
+  -Cwd "<项目路径>" -Prompt "只回复检查结论"
+
+# 公开资料检索：保留 session，预算或回合用完后仍可续接
+pwsh -NoProfile -File $workforce -Action run -Mode inspect `
+  -ContextProfile project -MaxTurns 4 -MaxBudgetUsd 2 `
+  -Model "deepseek-v4-flash[1m]" -Effort medium `
+  -Cwd "<项目路径>" -Prompt "搜索公开资料并给出带来源的简短结论"
+```
+
+只有任务需要持续在后台运行、以后还能接回时，才用 `start` 启动员工：
 
 ```powershell
 # 调研模式，flash 模型，中等推理
@@ -48,18 +67,27 @@ pwsh -NoProfile -File $workforce -Action start -Mode write `
   -Model "deepseek-v4-pro[1m]" -Effort high -Role implementer `
   -Cwd "<Git 项目路径>" -Prompt "实现 X 改动并跑目标测试"
 
-# 连通测试（无工具，flash + low 省成本）
+# 需要继承 MCP 时显式用 full；自定义代理先验证 Tool Search 兼容性
 pwsh -NoProfile -File $workforce -Action start -Mode inspect `
-  -NoTools -Effort low -Role smoke -Cwd "<项目路径>" -Prompt "只回复 WORKFORCE_SMOKE_READY"
+  -ContextProfile full -EnableToolSearch -Effort medium -Role researcher `
+  -Cwd "<项目路径>" -Prompt "用现有 MCP 调查问题并报告证据"
 ```
 
 status、log、reply、stop、remove 的完整用法见 [SKILL.md](./claude-workforce/SKILL.md)。
+
+## 成本与上下文档位
+
+`auto`：无工具任务自动选用 `minimal`，其他任务自动选用 `project`；`reply` 也使用这个默认逻辑。`minimal` 关闭 hooks、skills、plugins、MCP、memory 和 CLAUDE.md；`user` 只加载用户级配置但不加载 MCP；`project` 加载用户和项目规则但不加载 MCP；`full` 才继承全部配置和 MCP。
+
+完整工具环境可能在第一句话之前就注入数万 tokens。只有任务确实需要 MCP 时才用 `full`。自定义 `ANTHROPIC_BASE_URL` 下，Claude Code 默认可能不启用 Tool Search；`EnableToolSearch = $true` 必须经过真实 MCP 调用验证后再设。wrapper 还把单个 MCP 输出默认限制在 10,000 tokens。
+
+官方后台 `--bg` 不支持 `--max-budget-usd`，所以 `start` 没有伪造硬预算。要限制费用就用 `run` 或支持预算/权限回复的 MCP。`reply` 也必须显式给 `-MaxTurns` 和 `-MaxBudgetUsd`。一次公开搜索通常至少留 4 回合，覆盖工具发现、工具调用和最终回答。
 
 ## 模型选择
 
 初筛用 flash + medium，够快够便宜。深入诊断、安全审查、架构判断换 pro + high。max 留给多约束高风险场景。
 
-flash 适合批量试错，pro 更适合做最终判断。
+flash 适合批量试错，pro 更适合做最终判断。高 effort 会消耗更多 thinking tokens；机械任务不必延续上一阶段的 high/max 设置。
 
 ## 权限机制
 
