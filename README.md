@@ -39,7 +39,7 @@ $workforce = Join-Path $HOME '.codex\skills\claude-workforce\scripts\claude-work
 pwsh -NoProfile -File $workforce -Action capabilities
 ```
 
-Use `run` for one-off work. Track actual DeepSeek spend with the post-run `-ProviderBudgetCny` soft threshold and bound execution primarily with `-MaxTurns`:
+Use `run` for one-off work. Bound execution with `-MaxTurns` plus either an audited provider soft threshold (`-ProviderBudget`) or the SDK hard cap (`-MaxBudgetUsd`). The examples below use the bundled DeepSeek adapter; substitute your own model and budget policy as needed:
 
 ```powershell
 # Text or numeric judgment: minimal context, no tools, no retained session after success
@@ -82,23 +82,23 @@ For status, log, reply, stop, and remove commands, see [SKILL.md](./claude-workf
 
 A full tool environment can inject tens of thousands of tokens before the first task sentence. Use `full` only when the task actually needs MCP. With a custom `ANTHROPIC_BASE_URL`, Claude Code may not enable Tool Search automatically; set `EnableToolSearch = $true` only after a real MCP call succeeds. The wrapper also caps a single MCP result at 10,000 tokens by default.
 
-Do not add Codex/GPT and DeepSeek/CC tokens or prices together when judging quota savings. First measure the Codex context avoided by delegation, then subtract Codex dispatch, polling, targeted review, and rework; report DeepSeek spend separately. After CC returns, Codex should verify only the cited paths, lines, URLs, diff, and failures instead of rereading the same corpus. If a full reread is still required, treat the call as a second-opinion review, not a Codex-quota saving.
+Do not add supervisor and worker tokens or prices together when judging quota savings. First measure the supervisor context avoided by delegation, then subtract dispatch, polling, targeted review, and rework; report worker-provider spend separately. After CC returns, verify only the cited paths, lines, URLs, diff, and failures instead of rereading the same corpus. If a full reread is still required, treat the call as a second-opinion review, not a quota saving.
 
-With a custom DeepSeek endpoint, the Claude Agent SDK may estimate `total_cost_usd` from Anthropic model prices. That number is not the provider bill, so the wrapper hides it by default; add `-IncludeSdkCostEstimate` only when diagnosing the compatibility layer. Normal output derives `provider_billing_tokens` (cache miss/cache hit/output), `provider_cost_components_cny` (three component costs), and total `provider_cost_estimate_cny` from the selected model, returned `usage`, and audited DeepSeek rates. The local decimal calculation does not ask CC to reread the task. If usage is incomplete, it reports insufficient evidence instead of guessing.
+With a custom endpoint, the Claude Agent SDK may estimate `total_cost_usd` from Anthropic prices even when another provider handles the request. That number is not the provider bill, so the wrapper hides it by default; add `-IncludeSdkCostEstimate` only when diagnosing the compatibility layer. For a model with an audited rate adapter, normal output derives billing-token buckets, component costs, currency, and a provider estimate from returned `usage`. Unknown models remain usable, but no provider estimate is invented.
 
-`-ProviderBudgetCny` is a post-run soft threshold for accounting and alerts. `-MaxBudgetUsd` remains available as an SDK-internal hard stop, but it does not represent a DeepSeek CNY budget. Official background `--bg` supports neither limit, so `start` does not claim a hard cap. `run` and `reply` require finite `-MaxTurns` plus at least one of `-ProviderBudgetCny` or `-MaxBudgetUsd`. Allow at least four turns for typical public research so discovery, tool execution, and the final response can complete.
+`-ProviderBudget` is a post-run soft threshold for accounting and alerts; `-ProviderBudgetCny` remains its backward-compatible name. `-MaxBudgetUsd` is an SDK-internal hard stop and may not match a custom provider's bill. Official background `--bg` supports neither limit, so `start` does not claim a hard cap. `run` and `reply` require finite `-MaxTurns` plus one budget boundary. A provider-only threshold requires an audited model rate unless `-AllowUnpricedModel` explicitly acknowledges that no provider estimate can be enforced.
 
 `reply` also requires explicit `-Model` and `-Effort` values for every resumed task. Native print-mode replies are inspect-only; use the Claude Code MCP path when a resumed task needs interactive write approval. After `start`, the wrapper checks the supervisor roster and returns `roster_verified`, `roster_state`, `roster_cwd_match`, and `roster_session_id`; a roster-query failure is reported without pretending verification succeeded.
 
-When DeepSeek is materially cheaper than scarce Codex quota, delegate by default whenever the task has a clear contract, can return a compressed result, and does not require sensitive approval; do not impose a mechanical minimum file or token count. Around 3k tokens, two or more files, two independent searches, or a single huge/minified/generated file are clear delegation cases. Codex should usually handle only a single very short file under roughly 1k tokens when the change is one-step and immediately verifiable. Stop on scope drift, repeated reads, lack of progress, rework, or real provider CNY cost—not merely because the DS token count looks large.
+When the worker provider is materially cheaper than scarce supervisor quota, delegate work that has a clear contract, can return a compressed result, and does not require dense sensitive approvals. Do not impose a mechanical minimum file or token count. Stop on scope drift, repeated reads, lack of progress, rework, or actual provider cost—not merely because raw token counts look large.
 
 Do not discard paid work after a budget stop. Preserve the session and usage, diagnose whether context, cache, tool turns, or output caused the overrun, then give the same session a small evidence-based finalization budget with instructions to stop using tools and compress the existing result. Do not start a fresh reread.
 
-Cache reuse is an optimization, not a reason to disable useful parallel work. Prefer the same chief/session for related follow-ups and keep its context profile, tool catalog, and skill set stable unless the task needs a change. Compare fresh and resumed sessions separately: custom DeepSeek endpoints may leave `cache_creation_input_tokens` at zero, which makes creation-based reuse ratios meaningless; report the cache-read share and the measurement limitation instead.
+Cache reuse is an optimization, not a reason to disable useful parallel work. Prefer the same chief/session for related follow-ups and keep its context profile, tool catalog, and skill set stable unless the task needs a change. Compare fresh and resumed sessions separately; if a provider omits cache-creation fields, report the cache-read share and the measurement limitation instead of inventing a reuse ratio.
 
 ## Model routing
 
-Use flash + low/medium for retrieval, extraction, formatting, smoke tests, and mechanical checks. Use pro + high for design, complex debugging, code-change plans, compatibility decisions, security review, architecture, and final acceptance. If a wrong judgment would cause meaningful rework, do not stay on flash merely to save model cost. Reserve max for high-risk multi-constraint tasks.
+Use a fast/low-cost model with low or medium effort for retrieval, extraction, formatting, smoke tests, and mechanical checks. Use a higher-capability model with high effort for design, complex debugging, compatibility decisions, security review, architecture, and final acceptance. Reserve max for high-risk multi-constraint tasks. Provider-specific model mappings belong in references, not the core workflow.
 
 Route by error cost and expected rework, not only by input size. Higher effort spends more thinking tokens, so routine follow-up work should not inherit high/max from an earlier phase. Typical delivery estimates are 20–60 seconds for flash/low, 1–3 minutes for flash/medium, 3–8 minutes for pro/high, and 5–15 minutes for pro/max or multi-tool work. Check status near the expected milestone rather than polling continuously, except for permission requests or near-terminal work.
 
@@ -125,13 +125,15 @@ Read, Glob, Grep, WebSearch, and Plan are pre-authorized. Shell commands, Edit, 
 
 ## Extending to a new provider
 
-Adding a new LLM provider requires adapting the model ID mapping, effort/thinking controls, usage field extraction, and cost calculation. The wrapper's deterministic pricing functions are provider-specific; audit the provider's current token rates and billing fields before enabling cost estimation.
+The wrapper accepts arbitrary model IDs via pattern validation and leaves the default model unset unless `WORKFORCE_DEFAULT_MODEL` is present. For a new provider, verify effort semantics and usage fields, then add audited pricing only if provider-cost estimates are needed. See `claude-workforce/references/portability.md` for the checklist and `claude-workforce/references/deepseek-provider.md` for one adapter example.
+
+For non-Codex environments, set `WORKFORCE_NAMESPACE` to isolate workers across sessions. See `claude-workforce/references/portability.md` for OS-specific notes and extension points.
 
 MCP calls leave top-level `allowedTools` and `disallowedTools` empty. The `xihuai18/claude-code-mcp` (npm: `@leo000001/claude-code-mcp`) permission proxy uses `claude_code` for session management and `claude_code_check` (supporting `poll` and `respond_permission` actions) to surface each unresolved action to the supervisor. Compatibility is verified through the Codex runtime MCP catalog and real permission probes; this public project does not install or pin the MCP version. Approvals are for the current request and are not written back as persistent Claude settings.
 
 Agent is ask-by-default. `-AllowNestedAgents` promotes Agent to allow only inside the delegated session, so enable it when parallel work has a clear payoff and bounded scope.
 
-The legacy `AllowBroadWebFetch` input is still accepted for compatibility, but it no longer bypasses per-target review. Claude Code's `auto` mode is not used here: the official mode requires the Anthropic API and supported Claude models, while this workforce targets a custom DeepSeek provider.
+The legacy `AllowBroadWebFetch` input is still accepted for compatibility, but it no longer bypasses per-target review. This profile does not use Claude Code's `auto` permission mode; custom-provider deployments may not satisfy that mode's requirements, and explicit per-action review is easier to audit across providers.
 
 Treat `maxTurns` as a requested boundary that must be checked against the returned usage and status. This SDK/provider combination has exceeded the requested value in testing, so scope drift, repeated reads, progress, and actual provider cost remain the practical stop signals.
 

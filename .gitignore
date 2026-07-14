@@ -8,3 +8,11 @@ Thumbs.db
 claude-workforce.local.psd1
 auth.json
 settings.local.json
+*.pem
+*.key
+*.pfx
+*.p12
+credentials.*
+secrets.*
+config.toml
+*.local.*

@@ -1,0 +1,50 @@
+name: Test Claude Workforce
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'claude-workforce/**'
+      - 'tests/**'
+      - '.github/workflows/test.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'claude-workforce/**'
+      - 'tests/**'
+      - '.github/workflows/test.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: PowerShell 7 Unit Tests
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify PowerShell version
+        run: $PSVersionTable.PSVersion
+
+      - name: Parse all scripts
+        run: |
+          $paths = @(
+            'claude-workforce/scripts/claude-workforce.ps1',
+            'claude-workforce/scripts/new-workforce-session-profile.ps1',
+            'Install.ps1'
+          )
+          foreach ($p in $paths) {
+            $errs = $null
+            [void][Management.Automation.Language.Parser]::ParseFile($p, [ref]$null, [ref]$errs)
+            if ($errs.Count -gt 0) { throw "$p : $($errs[0].Message)" }
+          }
+          Write-Host 'All scripts parse cleanly.'
+
+      - name: Run unit test suite
+        run: ./tests/Test-ClaudeWorkforce.ps1
+        timeout-minutes: 5
+
+      - name: Verify git diff is clean (no whitespace errors)
+        run: git diff --check

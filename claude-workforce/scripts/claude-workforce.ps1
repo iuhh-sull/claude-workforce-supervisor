@@ -15,14 +15,15 @@ param(
     [ValidateSet('low', 'medium', 'high', 'xhigh', 'max')]
     [string]$Effort = 'medium',
 
-    [ValidateSet('deepseek-v4-flash[1m]', 'deepseek-v4-pro[1m]')]
-    [string]$Model = 'deepseek-v4-flash[1m]',
+    [ValidatePattern('^[\w.\-\/:\[\]]+$')]
+    [string]$Model = $env:WORKFORCE_DEFAULT_MODEL,
     [ValidateSet('auto', 'minimal', 'user', 'project', 'full')]
     [string]$ContextProfile = 'auto',
     [ValidateRange(0, 100)]
     [int]$MaxTurns = 0,
     [ValidateRange(0, 1000)]
     [decimal]$MaxBudgetUsd = 0,
+    [Alias('ProviderBudget')]
     [ValidateRange(0, 1000)]
     [decimal]$ProviderBudgetCny = 0,
     [ValidateRange(1000, 25000)]
@@ -48,7 +49,9 @@ param(
     [switch]$AllowLegacySession,
     [switch]$AllowProvenanceDrift,
     [switch]$ConfirmRemove,
-    [switch]$CheckedWorktree
+    [switch]$CheckedWorktree,
+    [switch]$AllowUnpricedModel,
+    [string]$Namespace
 )
 
 $ErrorActionPreference = 'Stop'
@@ -63,6 +66,7 @@ $script:RequestedMaxBudgetUsd = $MaxBudgetUsd
 $script:RequestedProviderBudgetCny = $ProviderBudgetCny
 $script:LastClaudeExitCode = 0
 $script:WorkforceProfileVersion = 1
+$script:NamespaceOverride = if (-not [string]::IsNullOrWhiteSpace($Namespace)) { $Namespace } else { $null }
 
 function Resolve-ClaudeExecutable {
     param(
@@ -125,18 +129,20 @@ function Resolve-ClaudeExecutable {
 }
 
 function Assert-ClaudeCapabilities {
-    $versionText = & $script:ClaudeExe --version 2>&1
-    $versionString = ($versionText | ForEach-Object { [string]$_ }) -join ''
+    $versionString = Invoke-ClaudeCapture -Arguments @('--version')
     if ($versionString -notmatch '(?<version>\d+\.\d+\.\d+)') {
         throw "Could not parse Claude Code version: $versionString"
     }
     $version = [version]$Matches.version
-    $minVersion = [version]'2.1.200'
-    if ($version -lt $minVersion) {
+    $minVersion = [version]'2.1.207'
+    $degradedRangeMin = [version]'2.1.200'
+    if ($version -lt $degradedRangeMin) {
         throw "Claude Code $version is below minimum supported version $minVersion."
     }
-    $agentsHelp = & $script:ClaudeExe agents --help 2>&1
-    $agentsHelpText = ($agentsHelp | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+    if ($version -lt $minVersion) {
+        Write-Warning "Claude Code $version is in the degraded range ($degradedRangeMin–$($minVersion - [version]'0.0.1')). Agent View background sessions in versions before $minVersion shipped fixes for blank worktree resume, stale roster entries after rm, and auto-recovery of unresponsive sessions. Persistent-worker reliability may be reduced. Upgrade to $minVersion or later for full support."
+    }
+    $agentsHelpText = Invoke-ClaudeCapture -Arguments @('agents', '--help')
     if ($agentsHelpText -notmatch 'Manage background agents') {
         throw 'Claude Code agents subcommand does not support background agents.'
     }
@@ -146,8 +152,7 @@ function Assert-ClaudeCapabilities {
     if ($agentsHelpText -notmatch '--permission-mode') {
         throw 'Claude Code agents subcommand does not support --permission-mode.'
     }
-    $mainHelp = & $script:ClaudeExe --help 2>&1
-    $mainHelpText = ($mainHelp | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+    $mainHelpText = Invoke-ClaudeCapture -Arguments @('--help')
     if ($mainHelpText -notmatch '--output-format') {
         throw 'Claude Code does not support --output-format required for resumable JSON replies.'
     }
@@ -160,73 +165,85 @@ function Invoke-ClaudeCapture {
         [switch]$UseToolSearch
     )
 
-    if ([IO.Path]::GetExtension($script:ClaudeExe) -in @('.exe', '.com')) {
-        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $ext = [IO.Path]::GetExtension($script:ClaudeExe).ToLowerInvariant()
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    if ($ext -in @('.exe', '.com') -or ([string]::IsNullOrEmpty($ext) -and -not $IsWindows)) {
         $startInfo.FileName = $script:ClaudeExe
-        $startInfo.UseShellExecute = $false
-        $startInfo.CreateNoWindow = $true
-        $startInfo.RedirectStandardOutput = $true
-        $startInfo.RedirectStandardError = $true
         foreach ($argument in $Arguments) {
             [void]$startInfo.ArgumentList.Add($argument)
         }
-        $startInfo.Environment['MAX_MCP_OUTPUT_TOKENS'] = [string]$script:MaxMcpOutputTokens
-        if ($UseToolSearch) {
-            $startInfo.Environment['ENABLE_TOOL_SEARCH'] = 'true'
-        }
-        else {
-            [void]$startInfo.Environment.Remove('ENABLE_TOOL_SEARCH')
-        }
-
-        $process = [Diagnostics.Process]::new()
-        $process.StartInfo = $startInfo
-        try {
-            if (-not $process.Start()) {
-                throw 'Claude Code process did not start.'
-            }
-            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-            $stderrTask = $process.StandardError.ReadToEndAsync()
-            if (-not $process.WaitForExit($script:ProcessTimeoutSeconds * 1000)) {
-                try {
-                    $process.Kill($true)
-                    $process.WaitForExit()
-                }
-                catch {
-                    # Preserve the timeout as the primary failure.
-                }
-                throw "Claude Code exceeded -ProcessTimeoutSeconds $($script:ProcessTimeoutSeconds); termination was requested for the started process tree, but detached descendants may survive. Check process and provider state before resuming or retrying."
-            }
-            $stdout = $stdoutTask.GetAwaiter().GetResult().Trim()
-            $stderr = $stderrTask.GetAwaiter().GetResult().Trim()
-            $exitCode = $process.ExitCode
-            $text = if (-not [string]::IsNullOrWhiteSpace($stdout)) { $stdout } else { $stderr }
-            $combinedText = @($stdout, $stderr) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-            $combinedText = $combinedText -join [Environment]::NewLine
-        }
-        finally {
-            $process.Dispose()
+    }
+    elseif ($ext -in @('.cmd', '.bat')) {
+        $startInfo.FileName = 'cmd.exe'
+        [void]$startInfo.ArgumentList.Add('/d')
+        [void]$startInfo.ArgumentList.Add('/s')
+        [void]$startInfo.ArgumentList.Add('/c')
+        [void]$startInfo.ArgumentList.Add($script:ClaudeExe)
+        foreach ($argument in $Arguments) {
+            [void]$startInfo.ArgumentList.Add($argument)
         }
     }
+    elseif ($ext -eq '.ps1') {
+        $psExe = if (Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue) { 'pwsh.exe' } else { 'powershell.exe' }
+        $startInfo.FileName = $psExe
+        [void]$startInfo.ArgumentList.Add('-NoProfile')
+        [void]$startInfo.ArgumentList.Add('-Command')
+        # Use single-quoted arguments to prevent PowerShell from interpreting
+        # --prefix tokens as parameter names (PowerShell 7+ normalizes --x to -x).
+        $sb = [Text.StringBuilder]::new()
+        [void]$sb.Append("& '").Append($script:ClaudeExe.Replace("'", "''")).Append("'")
+        foreach ($argument in $Arguments) {
+            [void]$sb.Append(" '").Append($argument.Replace("'", "''")).Append("'")
+        }
+        [void]$startInfo.ArgumentList.Add($sb.ToString())
+    }
     else {
-        $previousMcpLimit = $env:MAX_MCP_OUTPUT_TOKENS
-        $previousToolSearch = $env:ENABLE_TOOL_SEARCH
-        try {
-            $env:MAX_MCP_OUTPUT_TOKENS = [string]$script:MaxMcpOutputTokens
-            if ($UseToolSearch) {
-                $env:ENABLE_TOOL_SEARCH = 'true'
-            }
-            else {
-                $env:ENABLE_TOOL_SEARCH = $null
-            }
-            $lines = @(& $script:ClaudeExe @Arguments 2>&1)
-            $exitCode = $LASTEXITCODE
-            $text = ($lines | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
-            $combinedText = $text
+        $startInfo.FileName = $script:ClaudeExe
+        foreach ($argument in $Arguments) {
+            [void]$startInfo.ArgumentList.Add($argument)
         }
-        finally {
-            $env:MAX_MCP_OUTPUT_TOKENS = $previousMcpLimit
-            $env:ENABLE_TOOL_SEARCH = $previousToolSearch
+    }
+
+    $startInfo.Environment['MAX_MCP_OUTPUT_TOKENS'] = [string]$script:MaxMcpOutputTokens
+    if ($UseToolSearch) {
+        $startInfo.Environment['ENABLE_TOOL_SEARCH'] = 'true'
+    }
+    else {
+        [void]$startInfo.Environment.Remove('ENABLE_TOOL_SEARCH')
+    }
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw 'Claude Code process did not start.'
         }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($script:ProcessTimeoutSeconds * 1000)) {
+            try {
+                $process.Kill($true)
+                $process.WaitForExit()
+            }
+            catch {
+                # Preserve the timeout as the primary failure.
+            }
+            throw "Claude Code exceeded -ProcessTimeoutSeconds $($script:ProcessTimeoutSeconds); termination was requested for the started process tree, but detached descendants may survive. Check process and provider state before resuming or retrying."
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult().Trim()
+        $stderr = $stderrTask.GetAwaiter().GetResult().Trim()
+        $exitCode = $process.ExitCode
+        $text = if (-not [string]::IsNullOrWhiteSpace($stdout)) { $stdout } else { $stderr }
+        $combinedText = @($stdout, $stderr) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        $combinedText = $combinedText -join [Environment]::NewLine
+    }
+    finally {
+        $process.Dispose()
     }
 
     $script:LastClaudeExitCode = $exitCode
@@ -244,9 +261,14 @@ function Get-ContextProfileArguments {
         [switch]$ToolsDisabled
     )
 
-    $effectiveProfile = $Profile
-    if ($effectiveProfile -eq 'auto') {
-        $effectiveProfile = if ($ToolsDisabled) { 'minimal' } else { 'project' }
+    if ($ToolsDisabled) {
+        $effectiveProfile = 'minimal'
+    }
+    elseif ($Profile -eq 'auto') {
+        $effectiveProfile = 'project'
+    }
+    else {
+        $effectiveProfile = $Profile
     }
 
     $arguments = @('--no-chrome')
@@ -278,13 +300,20 @@ function Get-ContextProfileArguments {
 }
 
 function Assert-BoundedInvocation {
-    param([string]$ActionName)
+    param(
+        [string]$ActionName,
+        [string]$ModelName
+    )
 
     if ($script:RequestedMaxTurns -le 0) {
         throw "$ActionName requires an explicit positive -MaxTurns value."
     }
     if ($script:RequestedMaxBudgetUsd -le 0 -and $script:RequestedProviderBudgetCny -le 0) {
-        throw "$ActionName requires either -ProviderBudgetCny for a post-run DeepSeek cost threshold or -MaxBudgetUsd for Claude Code's internal hard cap."
+        throw "$ActionName requires either -ProviderBudget (alias -ProviderBudgetCny) for a post-run provider cost threshold or -MaxBudgetUsd for Claude Code's internal hard cap."
+    }
+    if ($script:RequestedProviderBudgetCny -gt 0 -and $script:RequestedMaxBudgetUsd -le 0 -and
+        $null -eq (Get-ProviderPricing -ModelName $ModelName) -and -not $AllowUnpricedModel) {
+        throw "$ActionName cannot enforce a provider soft budget because model '$ModelName' has no audited pricing. Add -MaxBudgetUsd, configure a priced model, or explicitly acknowledge this limitation with -AllowUnpricedModel."
     }
 }
 
@@ -365,7 +394,7 @@ function Get-ProviderPricing {
             }
         }
         default {
-            throw "No audited provider pricing is configured for model: $ModelName"
+            return $null
         }
     }
 }
@@ -378,6 +407,20 @@ function Get-ProviderCostEstimate {
     )
 
     $pricing = Get-ProviderPricing -ModelName $ModelName
+    if ($null -eq $pricing) {
+        return [pscustomobject]@{
+            estimated_cost = $null
+            currency = $null
+            budget = $(if ($BudgetCny -gt 0) { $BudgetCny } else { $null })
+            budget_type = 'post-run soft threshold'
+            cost_exceeds_budget = $null
+            pricing = $null
+            billing_tokens = $null
+            cost_components = $null
+            usage_complete = $false
+            note = "No audited provider pricing is configured for model: $ModelName"
+        }
+    }
     $summary = Get-UsageSummary -Usage $Usage
     $tokenValues = @(
         $summary.input_tokens,
@@ -429,7 +472,7 @@ function Get-ProviderCostEstimate {
             output = [decimal]::Round($outputCost, 9, [MidpointRounding]::AwayFromZero)
         }
         usage_complete = $true
-        note = 'Estimate from returned token usage and the audited public DeepSeek price table; provider dashboard or invoice is authoritative.'
+        note = 'Estimate from returned token usage and the audited provider price table; provider dashboard or invoice is authoritative.'
     }
 }
 
@@ -441,15 +484,36 @@ function Assert-WorkerId {
 }
 
 function Get-ThreadPrefix {
-    $threadId = [string]$env:CODEX_THREAD_ID
-    if ([string]::IsNullOrWhiteSpace($threadId)) {
+    $namespace = if (-not [string]::IsNullOrWhiteSpace($script:NamespaceOverride)) {
+        $script:NamespaceOverride
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:WORKFORCE_NAMESPACE)) {
+        $env:WORKFORCE_NAMESPACE
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:CODEX_THREAD_ID)) {
+        $env:CODEX_THREAD_ID
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:CLAUDE_CODE_SESSION_ID)) {
+        $env:CLAUDE_CODE_SESSION_ID
+    }
+    if ([string]::IsNullOrWhiteSpace($namespace)) {
         return 'cx-manual'
     }
-    $compact = ($threadId -replace '[^A-Za-z0-9]', '')
+    $compact = ($namespace -replace '[^A-Za-z0-9]', '')
+    if ([string]::IsNullOrWhiteSpace($compact)) {
+        return 'cx-manual'
+    }
     if ($compact.Length -gt 8) {
         $compact = $compact.Substring(0, 8)
     }
     return "cx-$($compact.ToLowerInvariant())"
+}
+
+function Test-ThreadScopeActive {
+    return -not [string]::IsNullOrWhiteSpace($script:NamespaceOverride) -or
+        -not [string]::IsNullOrWhiteSpace($env:WORKFORCE_NAMESPACE) -or
+        -not [string]::IsNullOrWhiteSpace($env:CODEX_THREAD_ID) -or
+        -not [string]::IsNullOrWhiteSpace($env:CLAUDE_CODE_SESSION_ID)
 }
 
 function Get-TextSha256 {
@@ -465,7 +529,7 @@ function Get-SafeGitRemote {
         return $null
     }
     $value = $Remote.Trim()
-    if ($value -match '^[A-Za-z]:[\\/]' -or $value -match '^\\\\' -or $value -match '^file://') {
+    if ($value -match '^[A-Za-z]:[\\/]' -or $value -match '^\\\\' -or $value -match '^file://' -or $value -match '^/' -or $value -match '^~') {
         return '[local-or-private-remote]'
     }
     if ($value -match '^(?:https?|ssh)://(?:[^/@]+@)?(?<host>[^/:]+)(?::\d+)?(?<path>/[^?#]*)') {
@@ -587,18 +651,20 @@ function Convert-WorkersFromJson {
     if ([string]::IsNullOrWhiteSpace($Json)) {
         return @()
     }
-    $lines = [regex]::Split($Json, '\r?\n')
-    $jsonStart = -1
-    for ($index = 0; $index -lt $lines.Count; $index++) {
-        if ($lines[$index].Trim() -eq '[') {
-            $jsonStart = $index
-            break
-        }
+    # Claude Code agents --json output is either pure JSON or a log prefix
+    # followed by the array. The last '\n[' (newline + bracket) reliably
+    # locates the JSON array start even when the log prefix contains
+    # bracketed timestamps (e.g. [2026-07-14 12:00:00]).
+    $start = $Json.IndexOf('[')
+    $nlBracketPos = $Json.LastIndexOf("`n[")
+    if ($nlBracketPos -ge 0) {
+        $start = $nlBracketPos + 1  # skip the newline, point to '['
     }
-    if ($jsonStart -lt 0) {
+    $end = $Json.LastIndexOf(']')
+    if ($start -lt 0 -or $end -lt $start) {
         throw 'Claude Code worker roster did not contain a JSON array.'
     }
-    $jsonText = ($lines[$jsonStart..($lines.Count - 1)] -join [Environment]::NewLine).Trim()
+    $jsonText = $Json.Substring($start, $end - $start + 1)
     try {
         $parsed = $jsonText | ConvertFrom-Json
     }
@@ -696,7 +762,7 @@ function Resolve-Worker {
         throw "Ambiguous worker ID: $Id matched $($matches.Count) workers. Use a more specific identifier."
     }
     $worker = $matches[0]
-    if (-not $AllThreads -and $env:CODEX_THREAD_ID) {
+    if (-not $AllThreads -and (Test-ThreadScopeActive)) {
         $prefix = Get-ThreadPrefix
         $candidateName = @('name', 'displayName', 'title') |
             ForEach-Object {
@@ -765,8 +831,10 @@ switch ($Action) {
             executable_hash_pinned      = $script:ExecutableHashPinned
             claude_version              = $version.ToString()
             workforce_profile_version   = $script:WorkforceProfileVersion
-            minimum_supported           = '2.1.200'
-            version_supported           = $version -ge [version]'2.1.200'
+            minimum_supported           = '2.1.207'
+            degraded_range              = '2.1.200–2.1.206'
+            version_supported           = $version -ge [version]'2.1.207'
+            version_degraded            = $version -ge [version]'2.1.200' -and $version -lt [version]'2.1.207'
             has_background              = $agentsHelp -match 'Manage background agents'
             has_json_list               = $agentsHelp -match '--json'
             has_permission_mode         = $agentsHelp -match '--permission-mode'
@@ -782,20 +850,21 @@ switch ($Action) {
             max_turns_hidden_supported  = $version -ge [version]'2.1.200'
             background_hard_budget_supported = $false
             native_windows              = $IsWindows
+            native_linux                = $IsLinux
+            native_macos                = $IsMacOS
             bypass_allowed              = $false
             default_effort              = 'medium'
-            default_model               = 'deepseek-v4-flash[1m]'
-            deep_review_model           = 'deepseek-v4-pro[1m]'
+            default_model               = if ([string]::IsNullOrWhiteSpace($env:WORKFORCE_DEFAULT_MODEL)) { $null } else { $env:WORKFORCE_DEFAULT_MODEL }
+            model_validation            = 'pattern'
+            provider_cost_currency_supported = $true
+            namespace_configurable      = $true
             model_routing_required      = $true
             inspect_permission_mode     = 'plan'
             write_permission_mode       = 'default'
-            default_ask_tools           = @('Bash', 'Edit', 'Write', 'NotebookEdit', 'WebFetch', 'mcp__plugin_exa_exa__web_fetch_exa', 'mcp__tavily__tavily_crawl', 'mcp__tavily__tavily_extract', 'mcp__tavily__tavily_map', 'mcp__plugin_context-mode_context-mode__ctx_fetch_and_index')
-            default_allow_tools         = @(
-                'WebSearch',
-                'mcp__plugin_exa_exa__web_search_exa',
-                'mcp__tavily__tavily_research',
-                'mcp__tavily__tavily_search'
-            )
+            default_ask_tools           = @('Bash', 'Edit', 'Write', 'NotebookEdit', 'WebFetch')
+            default_allow_tools         = @('WebSearch')
+            mcp_allow_injected          = ($env:WORKFORCE_MCP_ALLOW_TOOLS -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -as [array]
+            mcp_ask_injected            = ($env:WORKFORCE_MCP_ASK_TOOLS -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -as [array]
             public_search_default       = $true
             broad_web_fetch_allowed     = $false
             broad_web_fetch_legacy_requested = $script:BroadWebFetchAllowed
@@ -823,7 +892,7 @@ switch ($Action) {
 
     'run' {
         Assert-ClaudeCapabilities
-        Assert-BoundedInvocation -ActionName 'Run'
+        Assert-BoundedInvocation -ActionName 'Run' -ModelName $Model
         if ([string]::IsNullOrWhiteSpace($Prompt)) {
             throw 'Run requires -Prompt.'
         }
@@ -849,7 +918,7 @@ switch ($Action) {
         $settingsJson = Get-WorkforceSettingsJson -BroadWebFetchAllowed:$script:BroadWebFetchAllowed
         $taskText = [regex]::Replace($Prompt, '[\r\n]+', ' ').Trim()
         $runPrompt = @(
-            '[Codex supervisor bounded run]'
+            "[$(Get-ThreadPrefix) supervisor bounded run]"
             "Mode: $Mode"
             "PermissionMode: $permissionMode"
             "ContextProfile: $($profile.name)"
@@ -903,11 +972,15 @@ switch ($Action) {
             num_turns              = $runResult.num_turns
             usage                  = $usageSummary
             provider_cost_estimate_cny = $providerCost.estimated_cost
+            provider_cost_estimate = $providerCost.estimated_cost
+            provider_cost_currency = $providerCost.currency
             provider_budget_cny    = $providerCost.budget
+            provider_budget_limit  = $providerCost.budget
             provider_cost_exceeds_budget = $providerCost.cost_exceeds_budget
             provider_pricing       = $providerCost.pricing
             provider_billing_tokens = $providerCost.billing_tokens
             provider_cost_components_cny = $providerCost.cost_components
+            provider_cost_components = $providerCost.cost_components
             provider_cost_note     = $providerCost.note
             mode                   = $Mode
             context_profile        = $profile.name
@@ -925,10 +998,10 @@ switch ($Action) {
         if ($IncludeSdkCostEstimate) {
             $output['total_cost_usd'] = $runResult.total_cost_usd
             $output['sdk_total_cost_usd'] = $runResult.total_cost_usd
-            $output['sdk_cost_note'] = 'Claude Code internal estimate; not the DeepSeek provider bill.'
+            $output['sdk_cost_note'] = 'Claude Code internal estimate; not the provider bill.'
             $output['max_budget_usd'] = $MaxBudgetUsd
             $output['sdk_budget_enabled'] = $MaxBudgetUsd -gt 0
-            $output['sdk_budget_note'] = "Optional Claude Code internal hard cap; it does not use DeepSeek's provider pricing."
+            $output['sdk_budget_note'] = "Optional Claude Code internal hard cap; it does not use the provider's pricing."
         }
         [pscustomobject]$output | ConvertTo-Json -Depth $script:JsonDepth
         break
@@ -971,7 +1044,7 @@ switch ($Action) {
         $settingsJson = Get-WorkforceSettingsJson -NestedAgentsAllowed:$AllowNestedAgents -BroadWebFetchAllowed:$script:BroadWebFetchAllowed
         $taskText = [regex]::Replace($Prompt, '[\r\n]+', ' ').Trim()
         $contractParts = @(
-            '[Codex supervisor contract]'
+            "[$(Get-ThreadPrefix) supervisor contract]"
             "Owner: $(Get-ThreadPrefix)"
             "Worker: $workerName"
             "Mode: $Mode"
@@ -1012,29 +1085,64 @@ switch ($Action) {
         }
         $safeLaunch = Convert-TerminalLogTail -Raw $launchOutput -MaxChars 4000
 
-        $rosterVerified = $false
-        $rosterState = $null
-        $rosterCwdMatch = $false
+        $rosterEntryFound = $false
+        $rosterWorkerId = $null
         $rosterSessionId = $null
-        try {
-            $rosterJson = Invoke-ClaudeCapture -Arguments @('agents', '--json', '--all')
-            $rosterWorkers = @(Convert-WorkersFromJson -Json $rosterJson)
-            $matches = @($rosterWorkers | Where-Object { [string]$_.name -eq $workerName })
-            if ($matches.Count -eq 1) {
-                $entry = $matches[0]
-                $rosterVerified = $true
-                $rosterState = if ($entry.PSObject.Properties['status']) { [string]$entry.status } else { [string]$entry.state }
-                $rosterCwdMatch = [string]$entry.cwd -eq $resolvedCwd
-                $rosterSessionId = [string]$entry.sessionId
+        $rosterCwdMatch = $false
+        $rosterProcessStatus = $null
+        $rosterState = $null
+        $rosterVerified = $false
+        $rosterError = $null
+
+        $retryDelaysMs = @(0, 100, 300, 700, 1500)
+        $lastException = $null
+        foreach ($delayMs in $retryDelaysMs) {
+            if ($delayMs -gt 0) {
+                Start-Sleep -Milliseconds $delayMs
+            }
+            try {
+                $rosterJson = Invoke-ClaudeCapture -Arguments @('agents', '--json', '--all')
+                $rosterWorkers = @(Convert-WorkersFromJson -Json $rosterJson)
+                $matches = @($rosterWorkers | Where-Object { [string]$_.name -eq $workerName })
+                if ($matches.Count -eq 1) {
+                    $entry = $matches[0]
+                    $rosterEntryFound = $true
+                    $rosterWorkerId = [string]$entry.id
+                    $rosterSessionId = [string]$entry.sessionId
+                    $rosterCwdMatch = [IO.Path]::GetFullPath([string]$entry.cwd) -eq [IO.Path]::GetFullPath($resolvedCwd)
+                    $hasPid = $null -ne $entry.PSObject.Properties['pid'] -and -not [string]::IsNullOrWhiteSpace([string]$entry.pid)
+                    if ($hasPid -and $entry.PSObject.Properties['status']) {
+                        $rosterProcessStatus = [string]$entry.status
+                    }
+                    if ($entry.PSObject.Properties['state']) {
+                        $rosterState = [string]$entry.state
+                    }
+                    $sessionValid = -not [string]::IsNullOrWhiteSpace($rosterSessionId) -and
+                        -not [string]::IsNullOrWhiteSpace($rosterWorkerId)
+                    $rosterVerified = $rosterEntryFound -and $rosterCwdMatch -and $sessionValid
+                    $lastException = $null
+                    break
+                }
+                elseif ($matches.Count -eq 0) {
+                    $lastException = "Worker '$workerName' not yet registered in supervisor roster (attempt after ${delayMs}ms delay)."
+                }
+                else {
+                    $lastException = "Ambiguous roster match: $($matches.Count) entries for '$workerName'."
+                    break
+                }
+            }
+            catch {
+                $lastException = $_.Exception.Message
             }
         }
-        catch {
-            # Roster query is best-effort verification; launch succeeded even if the roster is unavailable.
-            $rosterState = 'roster-unavailable'
+        if ($null -ne $lastException -and -not $rosterEntryFound) {
+            $rosterError = $lastException
         }
 
         [pscustomobject]@{
+            worker_id              = $rosterWorkerId
             worker_name            = $workerName
+            session_id             = $rosterSessionId
             owner                  = (Get-ThreadPrefix)
             cwd                    = $resolvedCwd
             mode                   = $Mode
@@ -1049,10 +1157,14 @@ switch ($Action) {
             tool_search_enabled    = [bool]$profile.use_tool_search
             hard_budget_supported  = $false
             max_mcp_output_tokens  = $script:MaxMcpOutputTokens
-            roster_verified        = $rosterVerified
+            roster_entry_found     = $rosterEntryFound
+            roster_worker_id       = $rosterWorkerId
+            roster_session_id      = $rosterSessionId
+            roster_process_status  = $rosterProcessStatus
             roster_state           = $rosterState
             roster_cwd_match       = $rosterCwdMatch
-            roster_session_id      = $rosterSessionId
+            roster_verified        = $rosterVerified
+            roster_error           = $rosterError
             launch                 = $safeLaunch.text
             launch_source_chars    = $safeLaunch.source_chars
             launch_truncated       = $safeLaunch.truncated
@@ -1073,7 +1185,7 @@ switch ($Action) {
         }
         $workers = @(Convert-WorkersFromJson -Json (Invoke-ClaudeCapture -Arguments $arguments))
         $prefix = Get-ThreadPrefix
-        if (-not $AllThreads -and $env:CODEX_THREAD_ID) {
+        if (-not $AllThreads -and (Test-ThreadScopeActive)) {
             $workers = @($workers | Where-Object {
                 $worker = $_
                 $candidateName = @('name', 'displayName', 'title') |
@@ -1098,8 +1210,12 @@ switch ($Action) {
     'logs' {
         Assert-WorkerId -Value $Id
         $worker = Resolve-Worker -Id $Id -AllThreads:$AllThreads
+        $canonicalWorkerId = [string]$worker.id
+        if ([string]::IsNullOrWhiteSpace($canonicalWorkerId)) {
+            throw 'Worker roster entry is missing its canonical ID.'
+        }
         try {
-            $rawLogs = Invoke-ClaudeCapture -Arguments @('logs', $Id)
+            $rawLogs = Invoke-ClaudeCapture -Arguments @('logs', $canonicalWorkerId)
         }
         catch {
             if ($_.Exception.Message -match 'ENOENT|control\.sock|daemon') {
@@ -1109,7 +1225,7 @@ switch ($Action) {
         }
         $logView = Convert-TerminalLogTail -Raw $rawLogs -MaxChars $LogTailChars
         [pscustomobject]@{
-            id             = $Id
+            id             = $canonicalWorkerId
             source_chars   = $logView.source_chars
             clean_chars    = $logView.clean_chars
             returned_chars = $logView.returned_chars
@@ -1121,7 +1237,6 @@ switch ($Action) {
 
     'reply' {
         Assert-ClaudeCapabilities
-        Assert-BoundedInvocation -ActionName 'Reply'
         if ($Mode -eq 'write') {
             throw 'Native print-mode reply cannot perform interactive writes. Use Claude Code MCP for writes that require interactive permission handling.'
         }
@@ -1131,6 +1246,7 @@ switch ($Action) {
         if (-not $PSBoundParameters.ContainsKey('Effort')) {
             throw 'Reply requires an explicit -Effort so the resumed task uses a deliberate reasoning level rather than silently defaulting to medium.'
         }
+        Assert-BoundedInvocation -ActionName 'Reply' -ModelName $Model
         Assert-WorkerId -Value $Id
         if ([string]::IsNullOrWhiteSpace($Prompt)) {
             throw 'Reply requires -Prompt.'
@@ -1146,6 +1262,10 @@ switch ($Action) {
         }
 
         $worker = Resolve-Worker -Id $Id -AllThreads:$AllThreads
+        $canonicalWorkerId = [string]$worker.id
+        if ([string]::IsNullOrWhiteSpace($canonicalWorkerId)) {
+            throw 'Worker roster entry is missing its canonical ID.'
+        }
         $sessionId = [string]$worker.sessionId
         $workerCwd = [string]$worker.cwd
         if ([string]::IsNullOrWhiteSpace($sessionId) -or [string]::IsNullOrWhiteSpace($workerCwd)) {
@@ -1162,7 +1282,7 @@ switch ($Action) {
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
             Select-Object -First 1
         if ([string]::IsNullOrWhiteSpace($workerName)) {
-            $workerName = $Id
+            $workerName = $canonicalWorkerId
         }
         $currentProvenance = Get-WorkforceProvenance -Directory $workerCwd
         $provenanceCheck = Test-WorkerProvenance -WorkerName $workerName -CurrentProvenance $currentProvenance -PermitLegacy:$AllowLegacySession -PermitDrift:$AllowProvenanceDrift
@@ -1172,7 +1292,7 @@ switch ($Action) {
         $settingsJson = Get-WorkforceSettingsJson -NestedAgentsAllowed:$AllowNestedAgents -BroadWebFetchAllowed:$script:BroadWebFetchAllowed
         $taskText = [regex]::Replace($Prompt, '[\r\n]+', ' ').Trim()
         $followUp = @(
-            '[Codex supervisor follow-up]'
+            "[$(Get-ThreadPrefix) supervisor follow-up]"
             "Worker: $Id"
             "Mode: $Mode"
             "PermissionMode: $permissionMode"
@@ -1218,7 +1338,7 @@ switch ($Action) {
         $usageSummary = Get-UsageSummary -Usage $replyResult.usage
         $providerCost = Get-ProviderCostEstimate -ModelName $Model -Usage $replyResult.usage -BudgetCny $ProviderBudgetCny
         $output = [ordered]@{
-            id                     = $Id
+            id                     = $canonicalWorkerId
             session_id             = $sessionId
             action                 = 'reply'
             process_exit_code      = $script:LastClaudeExitCode
@@ -1239,11 +1359,15 @@ switch ($Action) {
             num_turns              = $replyResult.num_turns
             usage                  = $usageSummary
             provider_cost_estimate_cny = $providerCost.estimated_cost
+            provider_cost_estimate = $providerCost.estimated_cost
+            provider_cost_currency = $providerCost.currency
             provider_budget_cny    = $providerCost.budget
+            provider_budget_limit  = $providerCost.budget
             provider_cost_exceeds_budget = $providerCost.cost_exceeds_budget
             provider_pricing       = $providerCost.pricing
             provider_billing_tokens = $providerCost.billing_tokens
             provider_cost_components_cny = $providerCost.cost_components
+            provider_cost_components = $providerCost.cost_components
             provider_cost_note     = $providerCost.note
             result                 = $safeResult.text
             result_source_chars    = $safeResult.source_chars
@@ -1254,10 +1378,10 @@ switch ($Action) {
         if ($IncludeSdkCostEstimate) {
             $output['total_cost_usd'] = $replyResult.total_cost_usd
             $output['sdk_total_cost_usd'] = $replyResult.total_cost_usd
-            $output['sdk_cost_note'] = 'Claude Code internal estimate; not the DeepSeek provider bill.'
+            $output['sdk_cost_note'] = 'Claude Code internal estimate; not the provider bill.'
             $output['max_budget_usd'] = $MaxBudgetUsd
             $output['sdk_budget_enabled'] = $MaxBudgetUsd -gt 0
-            $output['sdk_budget_note'] = "Optional Claude Code internal hard cap; it does not use DeepSeek's provider pricing."
+            $output['sdk_budget_note'] = "Optional Claude Code internal hard cap; it does not use the provider's pricing."
         }
         [pscustomobject]$output | ConvertTo-Json -Depth $script:JsonDepth
         break
@@ -1276,9 +1400,13 @@ switch ($Action) {
     'stop' {
         Assert-WorkerId -Value $Id
         $worker = Resolve-Worker -Id $Id -AllThreads:$AllThreads
-        $safeOutput = Convert-TerminalLogTail -Raw (Invoke-ClaudeCapture -Arguments @('stop', $Id)) -MaxChars 4000
+        $canonicalWorkerId = [string]$worker.id
+        if ([string]::IsNullOrWhiteSpace($canonicalWorkerId)) {
+            throw 'Worker roster entry is missing its canonical ID.'
+        }
+        $safeOutput = Convert-TerminalLogTail -Raw (Invoke-ClaudeCapture -Arguments @('stop', $canonicalWorkerId)) -MaxChars 4000
         [pscustomobject]@{
-            id     = $Id
+            id     = $canonicalWorkerId
             action = 'stop'
             output = $safeOutput.text
             output_source_chars = $safeOutput.source_chars
@@ -1298,8 +1426,12 @@ switch ($Action) {
         else {
             Assert-WorkerId -Value $Id
             $worker = Resolve-Worker -Id $Id -AllThreads:$AllThreads
-            $arguments = @('respawn', $Id)
-            $target = $Id
+            $canonicalWorkerId = [string]$worker.id
+            if ([string]::IsNullOrWhiteSpace($canonicalWorkerId)) {
+                throw 'Worker roster entry is missing its canonical ID.'
+            }
+            $arguments = @('respawn', $canonicalWorkerId)
+            $target = $canonicalWorkerId
         }
         $safeOutput = Convert-TerminalLogTail -Raw (Invoke-ClaudeCapture -Arguments $arguments) -MaxChars 4000
         [pscustomobject]@{
@@ -1321,24 +1453,22 @@ switch ($Action) {
             throw 'Remove requires -CheckedWorktree. Confirm you have reviewed the worker status, logs, and associated worktree for uncommitted or unmerged changes before deletion.'
         }
         $worker = Resolve-Worker -Id $Id -AllThreads:$AllThreads
-        $status = @('status', 'state') |
-            ForEach-Object {
-                $property = $worker.PSObject.Properties[$_]
-                if ($property) { [string]$property.Value }
-            } |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            Select-Object -First 1
-        if ([string]::IsNullOrWhiteSpace($status)) {
-            throw "Cannot remove worker '$Id' because its status is unknown. Refresh the roster and verify the worker is stopped before retrying."
+        $canonicalWorkerId = [string]$worker.id
+        if ([string]::IsNullOrWhiteSpace($canonicalWorkerId)) {
+            throw 'Worker roster entry is missing its canonical ID.'
         }
-        if ($status -notmatch '^(stopped|completed|failed|error|dead|cancelled|exited)$') {
-            throw "Cannot remove worker '$Id' with non-terminal status '$status'. Stop it and verify a terminal state first."
+        $rosterState = if ($worker.PSObject.Properties['state']) { [string]$worker.state } else { $null }
+        if ([string]::IsNullOrWhiteSpace($rosterState)) {
+            throw "Cannot remove worker '$canonicalWorkerId' because its state is unknown. Refresh the roster and verify the worker is stopped before retrying."
         }
-        $safeOutput = Convert-TerminalLogTail -Raw (Invoke-ClaudeCapture -Arguments @('rm', $Id)) -MaxChars 4000
+        if ($rosterState -notmatch '^(stopped|done|failed|error|dead|cancelled|exited)$') {
+            throw "Cannot remove worker '$canonicalWorkerId' with non-terminal state '$rosterState'. Stop it and verify a terminal state first."
+        }
+        $safeOutput = Convert-TerminalLogTail -Raw (Invoke-ClaudeCapture -Arguments @('rm', $canonicalWorkerId)) -MaxChars 4000
         [pscustomobject]@{
-            id     = $Id
+            id     = $canonicalWorkerId
             action = 'remove'
-            status = $status
+            state  = $rosterState
             output = $safeOutput.text
             output_source_chars = $safeOutput.source_chars
             output_truncated = $safeOutput.truncated

@@ -17,22 +17,21 @@ $sensitiveReadRules = @(
     'Read(**/credentials.json)', 'Read(**/secrets.yaml)', 'Read(**/secrets.yml)',
     'Read(**/*.pem)', 'Read(**/*.key)', 'Read(**/*.pfx)', 'Read(**/*.p12)'
 )
+# Optional MCP tool names injected via environment variables (semicolon-separated).
+# Defaults are empty — only built-in Claude Code tools are pre-configured.
+# To add your MCP tools, set WORKFORCE_MCP_ALLOW_TOOLS / WORKFORCE_MCP_ASK_TOOLS in
+# the current workforce process environment. Example:
+#   $env:WORKFORCE_MCP_ALLOW_TOOLS = 'mcp__tavily__tavily_search;mcp__tavily__tavily_research'
+#   $env:WORKFORCE_MCP_ASK_TOOLS   = 'mcp__tavily__tavily_crawl;mcp__plugin_context-mode_context-mode__ctx_fetch_and_index'
+$extraAllowTools = if ($env:WORKFORCE_MCP_ALLOW_TOOLS) { @($env:WORKFORCE_MCP_ALLOW_TOOLS -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @() }
+$extraAskTools   = if ($env:WORKFORCE_MCP_ASK_TOOLS)   { @($env:WORKFORCE_MCP_ASK_TOOLS -split ';'   | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @() }
+
 $askRules = @(
-    'Bash', 'Edit', 'Write', 'NotebookEdit', 'WebFetch', 'Agent', 'Task',
-    'mcp__plugin_exa_exa__web_fetch_exa',
-    'mcp__tavily__tavily_crawl', 'mcp__tavily__tavily_extract',
-    'mcp__tavily__tavily_map',
-    'mcp__plugin_context-mode_context-mode__ctx_fetch_and_index',
-    'mcp__plugin_context-mode_context-mode__ctx_execute',
-    'mcp__plugin_context-mode_context-mode__ctx_execute_file',
-    'mcp__plugin_context-mode_context-mode__ctx_batch_execute'
-) + $sensitiveReadRules
+    'Bash', 'Edit', 'Write', 'NotebookEdit', 'WebFetch', 'Agent', 'Task'
+) + $extraAskTools + $sensitiveReadRules
 $allowRules = @(
-    'Read', 'Glob', 'Grep', 'WebSearch', 'Plan', 'EnterPlanMode', 'ExitPlanMode',
-    'mcp__plugin_exa_exa__web_search_exa',
-    'mcp__tavily__tavily_research', 'mcp__tavily__tavily_search',
-    'mcp__plugin_context-mode_context-mode__ctx_search'
-)
+    'Read', 'Glob', 'Grep', 'WebSearch', 'Plan', 'EnterPlanMode', 'ExitPlanMode'
+) + $extraAllowTools
 if ($AllowNestedAgents) {
     $askRules = @($askRules | Where-Object { $_ -notin @('Agent', 'Task') })
     $allowRules += @('Agent', 'Task')
