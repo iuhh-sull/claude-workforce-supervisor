@@ -73,6 +73,8 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action capabil
 
 跨模型评估必须分账：节省 Codex/GPT 配额是主指标，DeepSeek/CC tokens 和费用是独立副指标，不能直接相加。净节省只计算“CC 避免的 Codex 输入、输出和工具回灌”减去“Codex 派单、轮询、定点复核和返工”；若 Codex 最后仍通读同一批大材料，该调用只能记为质量交叉审查，不能记为节省额度。
 
+CC 自己产生的 usage、session、进程状态与日志元数据，优先让 DeepSeek 在原会话或原进程侧完成提取、归并、简单计算和状态判断，Codex 只接收小型结构化结果，不再读取完整 transcript。若同一工作可由本地确定性脚本直接完成，则先用脚本，避免额外模型调用；仅当数据依赖 CC 上下文或进程内部状态时才交给 DS。费用结果至少包含模型、三类计费 token、费率版本、分项费用和合计，便于 Codex 定点复核。
+
 第三方或自定义模型经 Claude Code/MCP 运行时，`totalCostUsd` 只视为兼容层的美元估算，不能当作供应商实际扣费，也不能与人民币账单直接比较。成本报告应分列模型 token 用量、MCP 估算值及其币种、供应商控制台/发票实际金额及其币种；实际账单以供应商记录为准。若返回值精确命中某个 Claude 官方价格公式，只能说明 Claude Code/SDK 套用了内置价目，不能说明第三方发生该笔扣款。若估算值与供应商账单按同一范围、同一币种换算后相差超过 20%，标记为定价映射不适用，并停止用该估算值做节省判断或预算回推。
 
 wrapper 已为两个 DeepSeek V4 模型加入确定性 CNY 估算：缓存未命中使用 `input_tokens + cache_creation_input_tokens`，缓存命中使用 `cache_read_input_tokens`，再加 `output_tokens`；根据本次 `Model` 选择 Flash 或 Pro 的已审计费率。结果会返回 `provider_billing_tokens` 三类 token、`provider_cost_components_cny` 三项费用和合计 `provider_cost_estimate_cny`。模型只返回原始 usage，归并和 decimal 乘法由本地 PowerShell 完成，不需要 CC 重读内容或再次推理。DeepSeek 控制台或发票仍是最终依据；usage 不完整时返回 null，不补猜，未知模型直接拒绝估价。
