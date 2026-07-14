@@ -21,7 +21,7 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action capabil
 |------|----------|----------|
 | `run` | 一次性调研、提取、文本或数字判断 | `-p` 同步执行；必须给 `-MaxTurns`，并给 DeepSeek 软阈值 `-ProviderBudgetCny` 或可选 SDK 硬闸 `-MaxBudgetUsd`；默认保存 session |
 | `start` | 需要后台运行、长期保留并可随时接回的员工 | 官方 `--bg` 不支持硬预算；靠阶段化派单、状态监控和 stop 止损 |
-| `reply` | 给既有员工追加短增量任务 | 通过 `-p --resume`；预算参数与 `run` 相同，并返回 subtype、usage、SDK 估价和 DeepSeek CNY 估算 |
+| `reply` | 给既有员工追加短增量任务 | 通过 `-p --resume`；预算参数与 `run` 相同，并返回 subtype、usage 和 DeepSeek CNY 估算 |
 
 只有 `run -NoTools -Ephemeral` 才禁用 session persistence，且只适合可丢弃的冒烟/连通性检查。普通 `run` 不使用 `--no-session-persistence`，避免预算或回合错误后无法取回已有工作。
 
@@ -75,7 +75,7 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action capabil
 
 CC 自己产生的 usage、session、进程状态与日志元数据，优先让 DeepSeek 在原会话或原进程侧完成提取、归并、简单计算和状态判断，Codex 只接收小型结构化结果，不再读取完整 transcript。若同一工作可由本地确定性脚本直接完成，则先用脚本，避免额外模型调用；仅当数据依赖 CC 上下文或进程内部状态时才交给 DS。费用结果至少包含模型、三类计费 token、费率版本、分项费用和合计，便于 Codex 定点复核。
 
-第三方或自定义模型经 Claude Code/MCP 运行时，`totalCostUsd` 只视为兼容层的美元估算，不能当作供应商实际扣费，也不能与人民币账单直接比较。成本报告应分列模型 token 用量、MCP 估算值及其币种、供应商控制台/发票实际金额及其币种；实际账单以供应商记录为准。若返回值精确命中某个 Claude 官方价格公式，只能说明 Claude Code/SDK 套用了内置价目，不能说明第三方发生该笔扣款。若估算值与供应商账单按同一范围、同一币种换算后相差超过 20%，标记为定价映射不适用，并停止用该估算值做节省判断或预算回推。
+第三方或自定义模型经 Claude Code/MCP 运行时，`totalCostUsd` 只视为兼容层的美元估算，不能当作供应商实际扣费，也不能与人民币账单直接比较。wrapper 默认不返回该字段；只有诊断兼容层时才显式加 `-IncludeSdkCostEstimate`，此时仍须把币种和“非供应商账单”说明一并保留。实际账单以供应商控制台或发票为准。若返回值精确命中某个 Claude 官方价格公式，只能说明 Claude Code/SDK 套用了内置价目，不能说明第三方发生该笔扣款。
 
 wrapper 已为两个 DeepSeek V4 模型加入确定性 CNY 估算：缓存未命中使用 `input_tokens + cache_creation_input_tokens`，缓存命中使用 `cache_read_input_tokens`，再加 `output_tokens`；根据本次 `Model` 选择 Flash 或 Pro 的已审计费率。结果会返回 `provider_billing_tokens` 三类 token、`provider_cost_components_cny` 三项费用和合计 `provider_cost_estimate_cny`。模型只返回原始 usage，归并和 decimal 乘法由本地 PowerShell 完成，不需要 CC 重读内容或再次推理。DeepSeek 控制台或发票仍是最终依据；usage 不完整时返回 null，不补猜，未知模型直接拒绝估价。
 

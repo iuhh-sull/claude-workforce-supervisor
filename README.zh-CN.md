@@ -83,7 +83,7 @@ status、log、reply、stop、remove 的完整用法见 [SKILL.md](./claude-work
 
 评估是否省额度时，不能把 Codex/GPT 和 DeepSeek/CC 的 token 或费用相加。先算 CC 避免了多少 Codex 上下文，再扣掉派单、轮询、定点复核和返工；DeepSeek 费用单独报告。CC 返回后，Codex 默认只核对它标出的路径、行号、URL、diff 和失败点，不再通读同一批材料。若最终仍需完整重读，这次调用属于交叉审查，不算节省 Codex 额度。
 
-自定义 DeepSeek 端点下，Claude Agent SDK 返回的 `total_cost_usd` 可能按 Anthropic 模型价目估算，不能当成供应商账单。wrapper 根据本次模型、`usage` 和已审计的 DeepSeek 价格返回 `provider_billing_tokens`（缓存未命中/缓存命中/输出三类 token）、`provider_cost_components_cny`（三项费用）和合计 `provider_cost_estimate_cny`。这是本地 decimal 计算，不会让 CC 重读任务。usage 不完整时会明确标记证据不足，不猜费用。
+自定义 DeepSeek 端点下，Claude Agent SDK 的 `total_cost_usd` 可能按 Anthropic 模型价目估算，不能当成供应商账单，wrapper 默认不会输出它；只有诊断兼容层时才加 `-IncludeSdkCostEstimate`。常规结果根据本次模型、`usage` 和已审计的 DeepSeek 价格返回 `provider_billing_tokens`（缓存未命中/缓存命中/输出三类 token）、`provider_cost_components_cny`（三项费用）和合计 `provider_cost_estimate_cny`。这是本地 decimal 计算，不会让 CC 重读任务。usage 不完整时会明确标记证据不足，不猜费用。
 
 `-ProviderBudgetCny` 是运行结束后的软阈值，适合记账和告警；`-MaxBudgetUsd` 仍可作为 SDK 内部硬停止，但它不代表 DeepSeek 人民币额度。官方后台 `--bg` 不支持这两个限制，所以 `start` 不声称有硬预算。`run` 和 `reply` 必须设置有限的 `-MaxTurns`，并至少设置 `-ProviderBudgetCny` 或 `-MaxBudgetUsd`。一次公开搜索通常至少留 4 回合，覆盖工具发现、工具调用和最终回答。
 

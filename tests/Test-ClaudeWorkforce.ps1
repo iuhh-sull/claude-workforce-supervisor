@@ -37,6 +37,7 @@ $requiredMarkers = @(
     'MaxTurns',
     'MaxBudgetUsd',
     'ProviderBudgetCny',
+    'IncludeSdkCostEstimate',
     'MaxMcpOutputTokens',
     'EnableToolSearch',
     '--max-turns',
@@ -169,7 +170,7 @@ exit 1
         }
         $result.reply_model_guard = $true
 
-        $errorResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'error recovery probe' -NoTools -MaxTurns 2 -MaxBudgetUsd 1 | ConvertFrom-Json)
+        $errorResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'error recovery probe' -NoTools -MaxTurns 2 -MaxBudgetUsd 1 -IncludeSdkCostEstimate | ConvertFrom-Json)
         if ($errorResult.process_exit_code -ne 1 -or $errorResult.result_subtype -ne 'error_max_turns' -or -not $errorResult.is_error) {
             throw 'Nonzero Claude result metadata was not preserved.'
         }
@@ -194,6 +195,9 @@ exit 1
         $providerBudgetResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'provider soft budget probe' -NoTools -MaxTurns 1 -ProviderBudgetCny ([decimal]'0.0001') | ConvertFrom-Json)
         if ($providerBudgetResult.result -ne 'SDK_BUDGET_PRESENT=False;PROMPT_AFTER_SEPARATOR=True' -or $providerBudgetResult.sdk_budget_enabled) {
             throw 'Provider-only budget enabled the SDK budget or the current prompt was not isolated after the option terminator.'
+        }
+        if ($null -ne $providerBudgetResult.PSObject.Properties['total_cost_usd'] -or $null -ne $providerBudgetResult.PSObject.Properties['sdk_total_cost_usd'] -or $null -ne $providerBudgetResult.PSObject.Properties['sdk_cost_note']) {
+            throw 'Default provider output exposed the misleading SDK cost estimate.'
         }
         if (-not $providerBudgetResult.provider_cost_exceeds_budget -or $providerBudgetResult.provider_budget_cny -ne [decimal]'0.0001') {
             throw 'Provider soft-budget status was not reported correctly.'
@@ -231,6 +235,9 @@ exit 1
     }
     if ('deepseek-v4-flash[1m]' -notin @($capabilities.provider_pricing_models) -or 'deepseek-v4-pro[1m]' -notin @($capabilities.provider_pricing_models)) {
         throw 'Provider pricing model capability metadata is incomplete.'
+    }
+    if (-not $capabilities.sdk_cost_estimate_optional -or $capabilities.sdk_cost_estimate_included_by_default) {
+        throw 'SDK cost estimate visibility defaults are unsafe or undocumented.'
     }
     if ($capabilities.default_context_profile -ne 'auto' -or $capabilities.default_mcp_output_tokens -ne 10000) {
         throw 'Cost-control defaults drifted from the documented profile.'

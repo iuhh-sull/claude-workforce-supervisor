@@ -40,6 +40,7 @@ param(
     [switch]$AllowNestedAgents,
     [switch]$AllowBroadWebFetch,
     [switch]$EnableToolSearch,
+    [switch]$IncludeSdkCostEstimate,
     [switch]$NoTools,
     [switch]$Ephemeral,
     [switch]$ConfirmRemove,
@@ -644,6 +645,8 @@ switch ($Action) {
             provider_budget_is_soft     = $true
             sdk_budget_uses_provider_pricing = $false
             provider_pricing_models     = @('deepseek-v4-flash[1m]', 'deepseek-v4-pro[1m]')
+            sdk_cost_estimate_optional  = $true
+            sdk_cost_estimate_included_by_default = $false
             max_turns_hidden_supported  = $version -ge [version]'2.1.200'
             background_hard_budget_supported = $false
             native_windows              = $IsWindows
@@ -756,16 +759,13 @@ switch ($Action) {
         $safeResult = Convert-TerminalLogTail -Raw ([string]$runResult.result) -MaxChars $ReplyMaxChars
         $usageSummary = Get-UsageSummary -Usage $runResult.usage
         $providerCost = Get-ProviderCostEstimate -ModelName $Model -Usage $runResult.usage -BudgetCny $ProviderBudgetCny
-        [pscustomobject]@{
+        $output = [ordered]@{
             action                 = 'run'
             session_id             = $runResult.session_id
             process_exit_code      = $script:LastClaudeExitCode
             result_subtype         = $runResult.subtype
             is_error               = [bool]$runResult.is_error
             num_turns              = $runResult.num_turns
-            total_cost_usd         = $runResult.total_cost_usd
-            sdk_total_cost_usd     = $runResult.total_cost_usd
-            sdk_cost_note          = 'Claude Code internal estimate; not the DeepSeek provider bill.'
             usage                  = $usageSummary
             provider_cost_estimate_cny = $providerCost.estimated_cost
             provider_budget_cny    = $providerCost.budget
@@ -778,9 +778,6 @@ switch ($Action) {
             context_profile        = $profile.name
             tool_search_enabled    = [bool]$profile.use_tool_search
             max_turns              = $MaxTurns
-            max_budget_usd         = $MaxBudgetUsd
-            sdk_budget_enabled     = $MaxBudgetUsd -gt 0
-            sdk_budget_note        = "Optional Claude Code internal hard cap; it does not use DeepSeek's provider pricing."
             max_mcp_output_tokens  = $script:MaxMcpOutputTokens
             ephemeral              = [bool]$Ephemeral
             no_tools               = [bool]$NoTools
@@ -789,7 +786,16 @@ switch ($Action) {
             result_clean_chars     = $safeResult.clean_chars
             result_returned_chars  = $safeResult.returned_chars
             result_truncated       = $safeResult.truncated
-        } | ConvertTo-Json -Depth $script:JsonDepth
+        }
+        if ($IncludeSdkCostEstimate) {
+            $output['total_cost_usd'] = $runResult.total_cost_usd
+            $output['sdk_total_cost_usd'] = $runResult.total_cost_usd
+            $output['sdk_cost_note'] = 'Claude Code internal estimate; not the DeepSeek provider bill.'
+            $output['max_budget_usd'] = $MaxBudgetUsd
+            $output['sdk_budget_enabled'] = $MaxBudgetUsd -gt 0
+            $output['sdk_budget_note'] = "Optional Claude Code internal hard cap; it does not use DeepSeek's provider pricing."
+        }
+        [pscustomobject]$output | ConvertTo-Json -Depth $script:JsonDepth
         break
     }
 
@@ -867,7 +873,7 @@ switch ($Action) {
         }
         $safeLaunch = Convert-TerminalLogTail -Raw $launchOutput -MaxChars 4000
 
-        [pscustomobject]@{
+        $output = [ordered]@{
             worker_name            = $workerName
             owner                  = (Get-ThreadPrefix)
             cwd                    = $resolvedCwd
@@ -1043,15 +1049,9 @@ switch ($Action) {
             context_profile        = $profile.name
             tool_search_enabled    = [bool]$profile.use_tool_search
             max_turns              = $MaxTurns
-            max_budget_usd         = $MaxBudgetUsd
-            sdk_budget_enabled     = $MaxBudgetUsd -gt 0
-            sdk_budget_note        = "Optional Claude Code internal hard cap; it does not use DeepSeek's provider pricing."
             max_mcp_output_tokens  = $script:MaxMcpOutputTokens
             is_error               = [bool]$replyResult.is_error
             num_turns              = $replyResult.num_turns
-            total_cost_usd         = $replyResult.total_cost_usd
-            sdk_total_cost_usd     = $replyResult.total_cost_usd
-            sdk_cost_note          = 'Claude Code internal estimate; not the DeepSeek provider bill.'
             usage                  = $usageSummary
             provider_cost_estimate_cny = $providerCost.estimated_cost
             provider_budget_cny    = $providerCost.budget
@@ -1065,7 +1065,16 @@ switch ($Action) {
             result_clean_chars     = $safeResult.clean_chars
             result_returned_chars  = $safeResult.returned_chars
             result_truncated       = $safeResult.truncated
-        } | ConvertTo-Json -Depth $script:JsonDepth
+        }
+        if ($IncludeSdkCostEstimate) {
+            $output['total_cost_usd'] = $replyResult.total_cost_usd
+            $output['sdk_total_cost_usd'] = $replyResult.total_cost_usd
+            $output['sdk_cost_note'] = 'Claude Code internal estimate; not the DeepSeek provider bill.'
+            $output['max_budget_usd'] = $MaxBudgetUsd
+            $output['sdk_budget_enabled'] = $MaxBudgetUsd -gt 0
+            $output['sdk_budget_note'] = "Optional Claude Code internal hard cap; it does not use DeepSeek's provider pricing."
+        }
+        [pscustomobject]$output | ConvertTo-Json -Depth $script:JsonDepth
         break
     }
 
