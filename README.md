@@ -88,9 +88,13 @@ With a custom DeepSeek endpoint, the Claude Agent SDK may estimate `total_cost_u
 
 `-ProviderBudgetCny` is a post-run soft threshold for accounting and alerts. `-MaxBudgetUsd` remains available as an SDK-internal hard stop, but it does not represent a DeepSeek CNY budget. Official background `--bg` supports neither limit, so `start` does not claim a hard cap. `run` and `reply` require finite `-MaxTurns` plus at least one of `-ProviderBudgetCny` or `-MaxBudgetUsd`. Allow at least four turns for typical public research so discovery, tool execution, and the final response can complete.
 
+`reply` also requires explicit `-Model` and `-Effort` values for every resumed task. Native print-mode replies are inspect-only; use the Claude Code MCP path when a resumed task needs interactive write approval. After `start`, the wrapper checks the supervisor roster and returns `roster_verified`, `roster_state`, `roster_cwd_match`, and `roster_session_id`; a roster-query failure is reported without pretending verification succeeded.
+
 When DeepSeek is materially cheaper than scarce Codex quota, delegate by default whenever the task has a clear contract, can return a compressed result, and does not require sensitive approval; do not impose a mechanical minimum file or token count. Around 3k tokens, two or more files, two independent searches, or a single huge/minified/generated file are clear delegation cases. Codex should usually handle only a single very short file under roughly 1k tokens when the change is one-step and immediately verifiable. Stop on scope drift, repeated reads, lack of progress, rework, or real provider CNY cost—not merely because the DS token count looks large.
 
 Do not discard paid work after a budget stop. Preserve the session and usage, diagnose whether context, cache, tool turns, or output caused the overrun, then give the same session a small evidence-based finalization budget with instructions to stop using tools and compress the existing result. Do not start a fresh reread.
+
+Cache reuse is an optimization, not a reason to disable useful parallel work. Prefer the same chief/session for related follow-ups and keep its context profile, tool catalog, and skill set stable unless the task needs a change. Compare fresh and resumed sessions separately: custom DeepSeek endpoints may leave `cache_creation_input_tokens` at zero, which makes creation-based reuse ratios meaningless; report the cache-read share and the measurement limitation instead.
 
 ## Model routing
 
@@ -123,7 +127,7 @@ Read, Glob, Grep, WebSearch, and Plan are pre-authorized. Shell commands, Edit, 
 
 Adding a new LLM provider requires adapting the model ID mapping, effort/thinking controls, usage field extraction, and cost calculation. The wrapper's deterministic pricing functions are provider-specific; audit the provider's current token rates and billing fields before enabling cost estimation.
 
-MCP calls leave top-level `allowedTools` and `disallowedTools` empty. The maintained `claude-code-mcp` permission proxy uses `canUseTool`, `claude_code_check`, and `respond_permission` to present each unresolved action to the supervisor. Approvals are for the current request and are not written back as persistent Claude settings.
+MCP calls leave top-level `allowedTools` and `disallowedTools` empty. The `xihuai18/claude-code-mcp` (npm: `@leo000001/claude-code-mcp`) permission proxy uses `claude_code` for session management and `claude_code_check` (supporting `poll` and `respond_permission` actions) to surface each unresolved action to the supervisor. Compatibility is verified through the Codex runtime MCP catalog and real permission probes; this public project does not install or pin the MCP version. Approvals are for the current request and are not written back as persistent Claude settings.
 
 Agent is ask-by-default. `-AllowNestedAgents` promotes Agent to allow only inside the delegated session, so enable it when parallel work has a clear payoff and bounded scope.
 

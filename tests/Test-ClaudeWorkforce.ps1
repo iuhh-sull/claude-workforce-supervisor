@@ -71,8 +71,14 @@ $result = [ordered]@{
     provider_cost_estimate = $false
     provider_soft_budget = $false
     reply_model_guard = $false
+    reply_write_mode_guard = $false
+    reply_effort_guard = $false
     reply_success_output = $false
     start_success_output = $false
+    start_roster_verified = $false
+    log_redaction_pem_block = $false
+    log_redaction_github_token = $false
+    log_redaction_aws_key = $false
     list_success_output = $false
     mcp_profile = $false
     local_remote_redacted = $false
@@ -141,8 +147,9 @@ $result.mcp_profile = $true
 
 if (-not $SkipRuntime) {
     $fakeClaude = Join-Path ([IO.Path]::GetTempPath()) "claude-workforce-fake-$([guid]::NewGuid().ToString('N')).ps1"
-    $fakeSource = @'
+$fakeSource = @'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Remaining)
+$rosterFile = Join-Path ([IO.Path]::GetTempPath()) ((Split-Path -LeafBase $PSCommandPath) + '-roster.json')
 if ('--version' -in $Remaining) {
     '2.1.207 (Claude Code)'
     exit 0
@@ -156,17 +163,41 @@ if ('--help' -in $Remaining) {
     exit 0
 }
 if ($Remaining.Count -ge 2 -and $Remaining[0] -eq 'agents' -and $Remaining[1] -eq '--json') {
-    [ordered]@{
+    $workers = @([ordered]@{
         id = 'worker-reply'
         name = 'cx-manual-reply-test'
         sessionId = '44444444-4444-4444-8444-444444444444'
         cwd = (Get-Location).Path
         status = 'completed'
-    } | ConvertTo-Json -AsArray
+    })
+    if (Test-Path -LiteralPath $rosterFile -PathType Leaf) {
+        $launched = Get-Content -LiteralPath $rosterFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $workers += [ordered]@{
+            id = 'worker-start'
+            name = [string]$launched.name
+            sessionId = '55555555-5555-4555-8555-555555555555'
+            cwd = [string]$launched.cwd
+            status = 'running'
+        }
+    }
+    $workers | ConvertTo-Json -Depth 4
     exit 0
 }
 if ('--bg' -in $Remaining) {
+    $nameIndex = [Array]::IndexOf($Remaining, '--name')
+    if ($nameIndex -ge 0 -and ($nameIndex + 1) -lt $Remaining.Count) {
+        [ordered]@{
+            name = $Remaining[$nameIndex + 1]
+            cwd = (Get-Location).Path
+        } | ConvertTo-Json -Compress | Set-Content -LiteralPath $rosterFile -Encoding UTF8
+    }
     'STARTED'
+    '-----BEGIN RSA PRIVATE ' + 'KEY-----'
+    'MIIE-fake-test-material'
+    '-----END RSA PRIVATE ' + 'KEY-----'
+    'github_token: ' + ('ghp_' + ('A1' * 20))
+    'AWS_ACCESS_KEY_ID=' + ('AK' + 'IA' + 'IOSFODNN7EXAMPLE')
+    'ordinary-output-kept'
     exit 0
 }
 if ('--resume' -in $Remaining) {
@@ -224,13 +255,35 @@ exit 1
         $result.background_budget_guard = $true
 
         $startResult = (& $scriptPath -Action start -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'start success probe' -NoTools | ConvertFrom-Json)
-        if ($startResult.launch -ne 'STARTED' -or $startResult.mode -ne 'inspect' -or -not $startResult.no_tools) {
+        if ($startResult.launch -notmatch 'STARTED' -or $startResult.launch -notmatch 'ordinary-output-kept' -or $startResult.mode -ne 'inspect' -or -not $startResult.no_tools) {
             throw 'Successful background start output was not returned.'
         }
         if ($startResult.workforce_profile_version -ne 1 -or $startResult.worker_name -notmatch '-w1-p[0-9a-f]{10}$' -or [string]::IsNullOrWhiteSpace([string]$startResult.launch_provenance.fingerprint)) {
             throw 'Background start did not record workforce profile and launch provenance.'
         }
         $result.start_success_output = $true
+        if (-not $startResult.roster_verified -or -not $startResult.roster_cwd_match -or
+            $startResult.roster_state -ne 'running' -or
+            $startResult.roster_session_id -ne '55555555-5555-4555-8555-555555555555') {
+            throw 'Background start did not verify the launched worker against the roster.'
+        }
+        $result.start_roster_verified = $true
+        $unredactedProbePattern = 'BEGIN.*PRIVATE.*KEY|MIIE-fake|ghp_|' + [regex]::Escape(('AK' + 'IAIOSFODNN7EXAMPLE'))
+        if ($startResult.launch -match $unredactedProbePattern) {
+            throw 'Sensitive-format launch output survived the unified redaction pipeline.'
+        }
+        if ($startResult.launch -notmatch '<redacted-pem-block>') {
+            throw 'PEM private key block was not redacted.'
+        }
+        $result.log_redaction_pem_block = $true
+        if ($startResult.launch -notmatch '<redacted-github-token>|github_token:\s*<redacted>') {
+            throw 'GitHub token format was not redacted.'
+        }
+        $result.log_redaction_github_token = $true
+        if ($startResult.launch -notmatch '<redacted-aws-access-key>|AWS_ACCESS_KEY_ID=<redacted>') {
+            throw 'AWS access key format was not redacted.'
+        }
+        $result.log_redaction_aws_key = $true
 
         $git = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
         $localOriginRepo = Join-Path ([IO.Path]::GetTempPath()) "claude-workforce-origin-$([guid]::NewGuid().ToString('N'))"
@@ -253,7 +306,7 @@ exit 1
         $result.credential_remote_redacted = $true
 
         $listResult = (& $scriptPath -Action list -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -All -AllThreads | ConvertFrom-Json)
-        if ($listResult.count -ne 1 -or $listResult.workers[0].id -ne 'worker-reply') {
+        if ($listResult.count -lt 1 -or 'worker-reply' -notin @($listResult.workers.id)) {
             throw 'Successful worker list output was not returned.'
         }
         $result.list_success_output = $true
@@ -275,9 +328,43 @@ exit 1
         }
         $result.reply_model_guard = $true
 
+        $replyWriteModeRejected = $false
+        try {
+            & $scriptPath -Action reply -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'worker-reply' -AllThreads -Mode write -Prompt 'write mode guard probe' -MaxTurns 1 -ProviderBudgetCny ([decimal]'0.01') -Model 'deepseek-v4-flash[1m]' | Out-Null
+        }
+        catch {
+            if ($_.Exception.Message -ceq 'Native print-mode reply cannot perform interactive writes. Use Claude Code MCP for writes that require interactive permission handling.') {
+                $replyWriteModeRejected = $true
+            }
+            else {
+                throw
+            }
+        }
+        if (-not $replyWriteModeRejected) {
+            throw 'Reply accepted write mode without a permission-handling path.'
+        }
+        $result.reply_write_mode_guard = $true
+
+        $replyEffortRejected = $false
+        try {
+            & $scriptPath -Action reply -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'worker-reply' -AllThreads -Prompt 'effort guard probe' -MaxTurns 1 -ProviderBudgetCny ([decimal]'0.01') -Model 'deepseek-v4-flash[1m]' -AllowLegacySession | Out-Null
+        }
+        catch {
+            if ($_.Exception.Message -ceq 'Reply requires an explicit -Effort so the resumed task uses a deliberate reasoning level rather than silently defaulting to medium.') {
+                $replyEffortRejected = $true
+            }
+            else {
+                throw
+            }
+        }
+        if (-not $replyEffortRejected) {
+            throw 'Reply silently accepted the default Effort instead of requiring deliberate routing.'
+        }
+        $result.reply_effort_guard = $true
+
         $legacyRejected = $false
         try {
-            & $scriptPath -Action reply -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'worker-reply' -AllThreads -Prompt 'legacy provenance probe' -NoTools -MaxTurns 1 -MaxBudgetUsd 1 -Model 'deepseek-v4-flash[1m]' | Out-Null
+            & $scriptPath -Action reply -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'worker-reply' -AllThreads -Prompt 'legacy provenance probe' -NoTools -MaxTurns 1 -MaxBudgetUsd 1 -Model 'deepseek-v4-flash[1m]' -Effort low | Out-Null
         }
         catch {
             $legacyRejected = $_.Exception.Message -match 'predates workforce provenance tracking'
@@ -286,7 +373,7 @@ exit 1
             throw 'Legacy worker resumed without an explicit provenance override.'
         }
 
-        $replyResult = (& $scriptPath -Action reply -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'worker-reply' -AllThreads -Prompt 'reply success probe' -NoTools -MaxTurns 1 -MaxBudgetUsd 1 -IncludeSdkCostEstimate -Model 'deepseek-v4-flash[1m]' -AllowLegacySession | ConvertFrom-Json)
+        $replyResult = (& $scriptPath -Action reply -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'worker-reply' -AllThreads -Prompt 'reply success probe' -NoTools -MaxTurns 1 -MaxBudgetUsd 1 -IncludeSdkCostEstimate -Model 'deepseek-v4-flash[1m]' -Effort low -AllowLegacySession | ConvertFrom-Json)
         if ($replyResult.action -ne 'reply' -or $replyResult.result -ne 'REPLY_OK' -or $replyResult.session_id -ne '44444444-4444-4444-8444-444444444444' -or $replyResult.session_provenance_status -ne 'legacy-override') {
             throw 'Successful reply output was not returned as one structured object.'
         }
@@ -346,6 +433,8 @@ exit 1
         $result.missing_usage_recovery = $true
     }
     finally {
+        $fakeRoster = Join-Path ([IO.Path]::GetTempPath()) ((Split-Path -LeafBase $fakeClaude) + '-roster.json')
+        Remove-Item -LiteralPath $fakeRoster -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $fakeClaude -Force -ErrorAction SilentlyContinue
         if ($localOriginRepo -and (Test-Path -LiteralPath $localOriginRepo -PathType Container)) {
             Remove-Item -LiteralPath $localOriginRepo -Recurse -Force -ErrorAction SilentlyContinue

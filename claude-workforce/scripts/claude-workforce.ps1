@@ -616,6 +616,12 @@ function Convert-TerminalLogTail {
     $clean = [regex]::Replace($Raw, '\x1B\][^\x07]*(?:\x07|\x1B\\)', '')
     $clean = [regex]::Replace($clean, '\x1B\[[0-?]*[ -/]*[@-~]', '')
     $clean = [regex]::Replace($clean, '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '')
+    $clean = [regex]::Replace($clean, '(?sm)^-----BEGIN\s.*?PRIVATE\sKEY-----\s*$.*?^-----END\s.*?PRIVATE\sKEY-----\s*$', '<redacted-pem-block>')
+    $clean = [regex]::Replace($clean, '(?im)^-----BEGIN(?:\s+[A-Z0-9]+)*\s+PRIVATE\s+KEY-----\s*$', '<redacted-pem-header>')
+    $clean = [regex]::Replace($clean, '(?i)\bgh[pousr]_[A-Za-z0-9]{36,}\b', '<redacted-github-token>')
+    $clean = [regex]::Replace($clean, '(?i)\bgithub_pat_[A-Za-z0-9_]{20,}\b', '<redacted-github-token>')
+    $clean = [regex]::Replace($clean, '(?i)\bAKIA[0-9A-Z]{16}\b', '<redacted-aws-access-key>')
+    $clean = [regex]::Replace($clean, '(?i)\bASIA[0-9A-Z]{16}\b', '<redacted-aws-temp-key>')
     $sensitiveKeyPattern = 'authorization|api[_-]?key|apikey|token|auth[_-]?token|password|passphrase|pwd|secret|client[_-]?secret|private[_-]?key|access[_-]?key|connection[_-]?string|credential'
     $quotedSecretPattern = '(?im)(["'']?(?:{0})["'']?\s*[:=]\s*)(?:"[^"\r\n]*"|''[^''\r\n]*''|[^\s,;}}\r\n]+)' -f $sensitiveKeyPattern
     $clean = [regex]::Replace(
@@ -1006,6 +1012,27 @@ switch ($Action) {
         }
         $safeLaunch = Convert-TerminalLogTail -Raw $launchOutput -MaxChars 4000
 
+        $rosterVerified = $false
+        $rosterState = $null
+        $rosterCwdMatch = $false
+        $rosterSessionId = $null
+        try {
+            $rosterJson = Invoke-ClaudeCapture -Arguments @('agents', '--json', '--all')
+            $rosterWorkers = @(Convert-WorkersFromJson -Json $rosterJson)
+            $matches = @($rosterWorkers | Where-Object { [string]$_.name -eq $workerName })
+            if ($matches.Count -eq 1) {
+                $entry = $matches[0]
+                $rosterVerified = $true
+                $rosterState = if ($entry.PSObject.Properties['status']) { [string]$entry.status } else { [string]$entry.state }
+                $rosterCwdMatch = [string]$entry.cwd -eq $resolvedCwd
+                $rosterSessionId = [string]$entry.sessionId
+            }
+        }
+        catch {
+            # Roster query is best-effort verification; launch succeeded even if the roster is unavailable.
+            $rosterState = 'roster-unavailable'
+        }
+
         [pscustomobject]@{
             worker_name            = $workerName
             owner                  = (Get-ThreadPrefix)
@@ -1022,6 +1049,10 @@ switch ($Action) {
             tool_search_enabled    = [bool]$profile.use_tool_search
             hard_budget_supported  = $false
             max_mcp_output_tokens  = $script:MaxMcpOutputTokens
+            roster_verified        = $rosterVerified
+            roster_state           = $rosterState
+            roster_cwd_match       = $rosterCwdMatch
+            roster_session_id      = $rosterSessionId
             launch                 = $safeLaunch.text
             launch_source_chars    = $safeLaunch.source_chars
             launch_truncated       = $safeLaunch.truncated
@@ -1091,8 +1122,14 @@ switch ($Action) {
     'reply' {
         Assert-ClaudeCapabilities
         Assert-BoundedInvocation -ActionName 'Reply'
+        if ($Mode -eq 'write') {
+            throw 'Native print-mode reply cannot perform interactive writes. Use Claude Code MCP for writes that require interactive permission handling.'
+        }
         if (-not $PSBoundParameters.ContainsKey('Model')) {
             throw 'Reply requires an explicit -Model so the resumed task is routed deliberately and provider cost uses the correct rate.'
+        }
+        if (-not $PSBoundParameters.ContainsKey('Effort')) {
+            throw 'Reply requires an explicit -Effort so the resumed task uses a deliberate reasoning level rather than silently defaulting to medium.'
         }
         Assert-WorkerId -Value $Id
         if ([string]::IsNullOrWhiteSpace($Prompt)) {
@@ -1117,11 +1154,6 @@ switch ($Action) {
         if (-not (Test-Path -LiteralPath $workerCwd -PathType Container)) {
             throw "Worker directory does not exist: $workerCwd"
         }
-        $isGitWorktree = Test-GitWorktree -Directory $workerCwd
-        if ($Mode -eq 'write' -and -not $isGitWorktree -and -not $AllowUnisolatedWrite) {
-            throw 'Write replies require a Git worktree/repository. Use -AllowUnisolatedWrite only after explicit user approval.'
-        }
-
         $workerName = @('name', 'displayName', 'title') |
             ForEach-Object {
                 $property = $worker.PSObject.Properties[$_]
@@ -1135,7 +1167,7 @@ switch ($Action) {
         $currentProvenance = Get-WorkforceProvenance -Directory $workerCwd
         $provenanceCheck = Test-WorkerProvenance -WorkerName $workerName -CurrentProvenance $currentProvenance -PermitLegacy:$AllowLegacySession -PermitDrift:$AllowProvenanceDrift
 
-        $permissionMode = if ($Mode -eq 'write') { 'default' } else { 'plan' }
+        $permissionMode = 'plan'
         $profile = Get-ContextProfileArguments -Profile $ContextProfile -ToolsDisabled:$NoTools
         $settingsJson = Get-WorkforceSettingsJson -NestedAgentsAllowed:$AllowNestedAgents -BroadWebFetchAllowed:$script:BroadWebFetchAllowed
         $taskText = [regex]::Replace($Prompt, '[\r\n]+', ' ').Trim()

@@ -88,9 +88,13 @@ status、log、reply、stop、remove 的完整用法见 [SKILL.md](./claude-work
 
 `-ProviderBudgetCny` 是运行结束后的软阈值，适合记账和告警；`-MaxBudgetUsd` 仍可作为 SDK 内部硬停止，但它不代表 DeepSeek 人民币额度。官方后台 `--bg` 不支持这两个限制，所以 `start` 不声称有硬预算。`run` 和 `reply` 必须设置有限的 `-MaxTurns`，并至少设置 `-ProviderBudgetCny` 或 `-MaxBudgetUsd`。一次公开搜索通常至少留 4 回合，覆盖工具发现、工具调用和最终回答。
 
+每次续接任务时，`reply` 还必须显式传入 `-Model` 和 `-Effort`。原生 print-mode 回复只支持检查模式；续接任务需要交互式写权限时，应走 Claude Code MCP。`start` 启动后会查询 supervisor roster，并返回 `roster_verified`、`roster_state`、`roster_cwd_match` 和 `roster_session_id`；查询失败会明确报告，不会伪装成已验证。
+
 DeepSeek 价格明显低于 Codex 稀缺额度时，只要任务能被清晰派单、结果可压缩且不涉及敏感审批，就默认优先交给 CC，不设机械的最低文件数或 token 门槛。约 3k tokens、2 个以上文件、2 组独立检索，或单个巨型/压缩/生成文件属于明确应委派场景；只有单个很短文件、约 1k tokens 内且一步可验收的小补丁通常由 Codex 直接做。止损看范围漂移、重复读取、无进展、返工和供应商人民币成本，不因 DS token 数看起来大而过早截断。
 
 预算耗尽后不要丢弃已经付费的工作：保留 session 和 usage，分析是上下文、缓存、工具回合还是输出导致超支，再给同一 session 一次有依据的小额收尾预算，让它停止新工具并压缩交付；不要另开会话重读。
+
+缓存复用是优化项，不是禁止并行的理由。同一目标的增量任务优先续接既有首席/session；没有功能需要时，尽量保持 context profile、tool catalog 和 skill 集合稳定。统计时要把 fresh 与 resumed 分开：自定义 DeepSeek 端点可能始终不填 `cache_creation_input_tokens`，此时基于 cache creation 的复用率没有意义，应报告 cache-read 占比并注明口径限制。
 
 ## 模型选择
 
@@ -119,7 +123,7 @@ Bash、Edit、Write、NotebookEdit、每个 WebFetch 目标、Agent 和带副作
 
 本 profile **不用** `bypassPermissions`、`acceptEdits`、`dontAsk`、`skip-permissions`，也没有任何形式的全工具自动批准。每次写入、shell 命令、网页抓取和子 Agent 启动都保持可审查。
 
-MCP 调用不在顶层预填 `allowedTools` 或 `disallowedTools`。社区维护的 `claude-code-mcp` 用 `canUseTool` 把请求交给 `claude_code_check`，Codex 通过 `respond_permission` 逐条处理。批准只管当前这一次，不会变成长期权限。
+MCP 调用不在顶层预填 `allowedTools` 或 `disallowedTools`。`xihuai18/claude-code-mcp`（npm: `@leo000001/claude-code-mcp`）通过 `claude_code` 管理会话，用 `claude_code_check`（支持 `poll` 和 `respond_permission` action）把未处理的权限请求交给 Codex 逐条审查。兼容性由 Codex 运行时 MCP catalog 和真实权限探针验证；本公共项目不安装或绑定 MCP 版本。批准只管当前这一次，不会变成长期权限。
 
 Agent 默认走 ask。只有传了 `-AllowNestedAgents` 才会在当前员工会话里改成 allow——前提是任务确实能并行、范围清楚、账算得过来。
 

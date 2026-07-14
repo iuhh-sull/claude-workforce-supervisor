@@ -49,7 +49,7 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action capabil
 - **allow**：Read、Glob、Grep、WebSearch、Plan/EnterPlanMode/ExitPlanMode，以及精确命名的公开搜索 MCP。Plan 是工作方式，不是风险动作。**注意**：allow 是免审批预授权（工具存在且本次直接放行），与工具的单纯存在（tools）不同。
 - **ask**：Bash、Edit、Write、NotebookEdit、WebFetch、Agent/Task、任意 URL 抓取和 context execute MCP；`.env`、认证配置、私钥、Codex/Claude settings 等敏感 Read 规则也放在 ask 中，优先于宽泛 Read allow。**注意**：ask 通过 `canUseTool` 向 Codex 逐次审批；宽泛 Read 虽在 allow，但敏感路径 Read 规则在 ask 中且优先级更高，因此仍会触发审批。
 - **deny**：正常 profile 保持空。**注意**：deny 是硬阻断，被 deny 的工具即使 ask/allow 规则匹配也无法使用。任务可能需要的能力不做永久封死；真正不可接受的具体请求由 Codex 拒绝。
-- **MCP 顶层工具表**：`allowedTools=[]`、`disallowedTools=[]`、`strictAllowedTools=false`，复用社区维护的 `claude-code-mcp` 的 `canUseTool`、`claude_code_check`、`respond_permission` 流程，不自制 shell/URL 权限解析器。Codex 可直接批准公开 URL、只读 Git/目录检查等低风险请求；写入、敏感读取、本地数据外发、认证、安装、发布和部署按具体输入审批。
+- **MCP 顶层工具表**：`allowedTools=[]`、`disallowedTools=[]`、`strictAllowedTools=false`，复用 `xihuai18/claude-code-mcp`（npm: `@leo000001/claude-code-mcp`）的 `claude_code` 与 `claude_code_check` 流程，不自制 shell/URL 权限解析器。`claude_code_check` 必须支持 `poll` 和 `respond_permission` action，由 Codex 运行时 MCP catalog 和真实权限探针验证工具存在及 schema 兼容性；本公共项目不安装或硬编码该 MCP 版本。Codex 可直接批准公开 URL、只读 Git/目录检查等低风险请求；写入、敏感读取、本地数据外发、认证、安装、发布和部署按具体输入审批。
 - **Agent**：默认 ask；显式 `-AllowNestedAgents` 时只在当前员工会话改为 allow。是否开启取决于任务能否独立并行以及总成本，而不是一律禁止。
 - **兼容键**：`AllowBroadWebFetch` 仍可被旧私有配置解析，但不再改变权限。公共 WebFetch 可由 MCP 主管快速批准，回环、私网、带凭据或可能外发本地数据的目标继续拦截。
 
@@ -83,6 +83,8 @@ CC 自己产生的 usage、session、进程状态与日志元数据，优先让 
 第三方或自定义模型经 Claude Code/MCP 运行时，`totalCostUsd` 只视为兼容层的美元估算，不能当作供应商实际扣费，也不能与人民币账单直接比较。wrapper 默认不返回该字段；只有诊断兼容层时才显式加 `-IncludeSdkCostEstimate`，此时仍须把币种和“非供应商账单”说明一并保留。实际账单以供应商控制台或发票为准。若返回值精确命中某个 Claude 官方价格公式，只能说明 Claude Code/SDK 套用了内置价目，不能说明第三方发生该笔扣款。
 
 wrapper 已为两个 DeepSeek V4 模型加入确定性 CNY 估算：缓存未命中使用 `input_tokens + cache_creation_input_tokens`，缓存命中使用 `cache_read_input_tokens`，再加 `output_tokens`；根据本次 `Model` 选择 Flash 或 Pro 的已审计费率。结果会返回 `provider_billing_tokens` 三类 token、`provider_cost_components_cny` 三项费用和合计 `provider_cost_estimate_cny`。模型只返回原始 usage，归并和 decimal 乘法由本地 PowerShell 完成，不需要 CC 重读内容或再次推理。DeepSeek 控制台或发票仍是最终依据；usage 不完整时返回 null，不补猜，未知模型直接拒绝估价。
+
+**缓存复用是优化项，不是限制并行的硬指标。** 同一目标的增量任务优先续接既有首席/session，并在没有功能需要时保持 context profile、tool catalog 和 skill 集合稳定；范围清楚、独立收益明确的子 Agent 仍可正常 fan out，不为提高表面命中率而机械禁止。统计时把 fresh/resumed、短会话/长会话分开；当前 DeepSeek Anthropic 兼容层可能不填 `cache_creation_input_tokens`，此时 `cache_read / (cache_creation + cache_read)` 会退化，不能据此评价缓存效果，优先报告 `cache_read / (input + cache_read)` 及口径限制。
 
 `-ProviderBudgetCny` 是调用结束后核验的软阈值，不会中途终止进程。`-MaxBudgetUsd` 仍按 Claude Code 的内置美元估值触发，只是可选的 SDK 硬闸；在自定义 DeepSeek provider 下不代表实际美元消费。默认优先使用 `MaxTurns`、严格工具/读取范围、输出上限和 `ProviderBudgetCny`，避免错误 Opus 价在最终交付前截断；确需纵深止损时才另外给足够宽的 `MaxBudgetUsd`。
 
@@ -234,7 +236,7 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action logs -I
 pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action reply -Id "<worker-id>" -Mode inspect -ContextProfile project -MaxTurns 2 -ProviderBudgetCny 0.15 -Model "deepseek-v4-pro[1m]" -Effort high -Prompt "基于前面的结论补充一项检查"
 ```
 
-`reply` 必须显式指定 `-Model`，按当前增量任务重新选择 Flash/Pro，避免续接 Pro 员工时静默降为默认 Flash，也确保供应商费用使用正确费率。未指定 `-ContextProfile` 时按 `auto` 处理：加 `-NoTools` 选 `minimal`，否则选 `project`，默认不继承 MCP。纯文本连通性或记忆测试加 `-NoTools -Model "deepseek-v4-flash[1m]" -Effort low`。`reply` 是同步的，适合短增量任务；需要持续后台监控的长任务使用 `respawn` 后手动 attach，或派发新的后台员工。
+`reply` 必须同时显式指定 `-Model` 和 `-Effort`，按当前增量任务重新选择模型与推理强度，避免续接员工时静默沿用不合适的默认值，也确保供应商费用使用正确费率。原生 print-mode `reply` 只支持 `-Mode inspect`；需要交互式写权限时改用 Claude Code MCP。未指定 `-ContextProfile` 时按 `auto` 处理：加 `-NoTools` 选 `minimal`，否则选 `project`，默认不继承 MCP。纯文本连通性或记忆测试加 `-NoTools -Model "deepseek-v4-flash[1m]" -Effort low`。`reply` 是同步的，适合短增量任务；需要持续后台监控的长任务使用 `respawn` 后手动 attach，或派发新的后台员工。
 
 `reply` 的权限模型与 `start` 一致：正常模式拥有完整工具集，通过 `ask` 规则控制；`-NoTools` 移除全部工具。`reply` 返回的 `result` 字段经过与 `logs` 相同的清理/脱敏/截断管线，上限由 `-ReplyMaxChars` 控制。
 
