@@ -38,18 +38,18 @@ $workforce = Join-Path $HOME '.codex\skills\claude-workforce\scripts\claude-work
 pwsh -NoProfile -File $workforce -Action capabilities
 ```
 
-一次性任务优先用有硬预算的 `run`：
+一次性任务优先用 `run`。DeepSeek 的实际费用用 `-ProviderBudgetCny` 做运行后软阈值，执行边界主要由 `-MaxTurns` 控制：
 
 ```powershell
 # 纯文本/数字判断：最小上下文、无工具，成功后不留会话
 pwsh -NoProfile -File $workforce -Action run -Mode inspect -NoTools -Ephemeral `
-  -ContextProfile minimal -MaxTurns 1 -MaxBudgetUsd 1 `
+  -ContextProfile minimal -MaxTurns 1 -ProviderBudgetCny 0.01 `
   -Model "deepseek-v4-flash[1m]" -Effort low `
   -Cwd "<项目路径>" -Prompt "只回复检查结论"
 
 # 公开资料检索：保留 session，预算或回合用完后仍可续接
 pwsh -NoProfile -File $workforce -Action run -Mode inspect `
-  -ContextProfile project -MaxTurns 4 -MaxBudgetUsd 2 `
+  -ContextProfile project -MaxTurns 4 -ProviderBudgetCny 0.10 `
   -Model "deepseek-v4-flash[1m]" -Effort medium `
   -Cwd "<项目路径>" -Prompt "搜索公开资料并给出带来源的简短结论"
 ```
@@ -83,15 +83,19 @@ status、log、reply、stop、remove 的完整用法见 [SKILL.md](./claude-work
 
 评估是否省额度时，不能把 Codex/GPT 和 DeepSeek/CC 的 token 或费用相加。先算 CC 避免了多少 Codex 上下文，再扣掉派单、轮询、定点复核和返工；DeepSeek 费用单独报告。CC 返回后，Codex 默认只核对它标出的路径、行号、URL、diff 和失败点，不再通读同一批材料。若最终仍需完整重读，这次调用属于交叉审查，不算节省 Codex 额度。
 
-官方后台 `--bg` 不支持 `--max-budget-usd`，所以 `start` 没有伪造硬预算。要限制费用就用 `run` 或支持预算/权限回复的 MCP。`reply` 也必须显式给 `-MaxTurns` 和 `-MaxBudgetUsd`。一次公开搜索通常至少留 4 回合，覆盖工具发现、工具调用和最终回答。
+自定义 DeepSeek 端点下，Claude Agent SDK 返回的 `total_cost_usd` 可能按 Anthropic 模型价目估算，不能当成供应商账单。wrapper 根据本次模型、`usage` 和已审计的 DeepSeek 价格返回 `provider_billing_tokens`（缓存未命中/缓存命中/输出三类 token）、`provider_cost_components_cny`（三项费用）和合计 `provider_cost_estimate_cny`。这是本地 decimal 计算，不会让 CC 重读任务。usage 不完整时会明确标记证据不足，不猜费用。
+
+`-ProviderBudgetCny` 是运行结束后的软阈值，适合记账和告警；`-MaxBudgetUsd` 仍可作为 SDK 内部硬停止，但它不代表 DeepSeek 人民币额度。官方后台 `--bg` 不支持这两个限制，所以 `start` 不声称有硬预算。`run` 和 `reply` 必须设置有限的 `-MaxTurns`，并至少设置 `-ProviderBudgetCny` 或 `-MaxBudgetUsd`。一次公开搜索通常至少留 4 回合，覆盖工具发现、工具调用和最终回答。
+
+DeepSeek 价格较低后，委派门槛可相应下调：约 5k tokens、3 个以上文件、2 组以上独立检索，或单个巨型/压缩/生成文件即可考虑交给 CC。2 个以内普通文件、约 3k tokens 内的小补丁仍由 Codex 直接做，减少派单和复核开销。
 
 预算耗尽后不要丢弃已经付费的工作：保留 session 和 usage，分析是上下文、缓存、工具回合还是输出导致超支，再给同一 session 一次有依据的小额收尾预算，让它停止新工具并压缩交付；不要另开会话重读。
 
 ## 模型选择
 
-初筛用 flash + medium，够快够便宜。深入诊断、安全审查、架构判断换 pro + high。max 留给多约束高风险场景。
+检索、提取、格式化、冒烟和机械检查用 flash + low/medium。方案设计、复杂 debug、代码修改计划、兼容性判断、安全审查、架构决策和最终验收用 pro + high；只要判断失误会带来明显返工，就不要为了省一点模型费留在 flash。max 留给多约束高风险场景。
 
-flash 适合批量试错，pro 更适合做最终判断。高 effort 会消耗更多 thinking tokens；机械任务不必延续上一阶段的 high/max 设置。
+模型按错误代价和返工成本选择，不只看材料长度。高 effort 会消耗更多 thinking tokens；机械跟进不必延续上一阶段的 high/max 设置。常见交付时间可按 flash/low 20–60 秒、flash/medium 1–3 分钟、pro/high 3–8 分钟、pro/max 或多工具任务 5–15 分钟估计；到预计节点再查状态，权限请求和接近完成时例外。
 
 ## 权限机制
 

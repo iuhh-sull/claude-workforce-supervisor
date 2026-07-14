@@ -38,18 +38,18 @@ $workforce = Join-Path $HOME '.codex\skills\claude-workforce\scripts\claude-work
 pwsh -NoProfile -File $workforce -Action capabilities
 ```
 
-Use a hard-capped `run` for one-off work:
+Use `run` for one-off work. Track actual DeepSeek spend with the post-run `-ProviderBudgetCny` soft threshold and bound execution primarily with `-MaxTurns`:
 
 ```powershell
 # Text or numeric judgment: minimal context, no tools, no retained session after success
 pwsh -NoProfile -File $workforce -Action run -Mode inspect -NoTools -Ephemeral `
-  -ContextProfile minimal -MaxTurns 1 -MaxBudgetUsd 1 `
+  -ContextProfile minimal -MaxTurns 1 -ProviderBudgetCny 0.01 `
   -Model "deepseek-v4-flash[1m]" -Effort low `
   -Cwd "<project-path>" -Prompt "Return only the requested verdict"
 
 # Public research: retain the session so a turn or budget error can be resumed
 pwsh -NoProfile -File $workforce -Action run -Mode inspect `
-  -ContextProfile project -MaxTurns 4 -MaxBudgetUsd 2 `
+  -ContextProfile project -MaxTurns 4 -ProviderBudgetCny 0.10 `
   -Model "deepseek-v4-flash[1m]" -Effort medium `
   -Cwd "<project-path>" -Prompt "Search public sources and return a short sourced conclusion"
 ```
@@ -83,15 +83,19 @@ A full tool environment can inject tens of thousands of tokens before the first 
 
 Do not add Codex/GPT and DeepSeek/CC tokens or prices together when judging quota savings. First measure the Codex context avoided by delegation, then subtract Codex dispatch, polling, targeted review, and rework; report DeepSeek spend separately. After CC returns, Codex should verify only the cited paths, lines, URLs, diff, and failures instead of rereading the same corpus. If a full reread is still required, treat the call as a second-opinion review, not a Codex-quota saving.
 
-Official background `--bg` does not support `--max-budget-usd`, so `start` does not pretend to enforce a hard cap. Use `run` or an MCP client with budget and permission handling when a hard limit matters. `reply` also requires explicit `-MaxTurns` and `-MaxBudgetUsd`. Allow at least four turns for a typical public search so tool discovery, tool execution, and the final answer can all complete.
+With a custom DeepSeek endpoint, the Claude Agent SDK may estimate `total_cost_usd` from Anthropic model prices. That number is not the provider bill. From the selected model, returned `usage`, and audited DeepSeek rates, the wrapper derives `provider_billing_tokens` (cache miss/cache hit/output), `provider_cost_components_cny` (three component costs), and total `provider_cost_estimate_cny`. The local decimal calculation does not ask CC to reread the task. If usage is incomplete, it reports insufficient evidence instead of guessing.
+
+`-ProviderBudgetCny` is a post-run soft threshold for accounting and alerts. `-MaxBudgetUsd` remains available as an SDK-internal hard stop, but it does not represent a DeepSeek CNY budget. Official background `--bg` supports neither limit, so `start` does not claim a hard cap. `run` and `reply` require finite `-MaxTurns` plus at least one of `-ProviderBudgetCny` or `-MaxBudgetUsd`. Allow at least four turns for typical public research so discovery, tool execution, and the final response can complete.
+
+DeepSeek's low provider price lowers the practical delegation threshold: consider CC around 5k tokens, three or more files, two or more independent searches, or a single huge/minified/generated file. Codex should usually handle ordinary changes within two files and roughly 3k tokens to avoid dispatch and review overhead.
 
 Do not discard paid work after a budget stop. Preserve the session and usage, diagnose whether context, cache, tool turns, or output caused the overrun, then give the same session a small evidence-based finalization budget with instructions to stop using tools and compress the existing result. Do not start a fresh reread.
 
 ## Model routing
 
-Use flash + medium for retrieval, screening, formatting, and smoke tests. Switch to pro + high for deeper diagnostics, security review, and architecture calls. Reserve max for high-risk multi-constraint tasks.
+Use flash + low/medium for retrieval, extraction, formatting, smoke tests, and mechanical checks. Use pro + high for design, complex debugging, code-change plans, compatibility decisions, security review, architecture, and final acceptance. If a wrong judgment would cause meaningful rework, do not stay on flash merely to save model cost. Reserve max for high-risk multi-constraint tasks.
 
-Flash is cheap and fast for exploration. Pro is slower but more reliable for judgment. Higher effort also spends more thinking tokens, so routine follow-up work should not inherit high/max from an earlier phase.
+Route by error cost and expected rework, not only by input size. Higher effort spends more thinking tokens, so routine follow-up work should not inherit high/max from an earlier phase. Typical delivery estimates are 20–60 seconds for flash/low, 1–3 minutes for flash/medium, 3–8 minutes for pro/high, and 5–15 minutes for pro/max or multi-tool work. Check status near the expected milestone rather than polling continuously, except for permission requests or near-terminal work.
 
 ## Permissions
 

@@ -23,6 +23,8 @@ param(
     [int]$MaxTurns = 0,
     [ValidateRange(0, 1000)]
     [decimal]$MaxBudgetUsd = 0,
+    [ValidateRange(0, 1000)]
+    [decimal]$ProviderBudgetCny = 0,
     [ValidateRange(1000, 25000)]
     [int]$MaxMcpOutputTokens = 10000,
     [string]$ClaudeExecutable,
@@ -52,6 +54,7 @@ $script:ToolSearchEnabled = [bool]$EnableToolSearch
 $script:MaxMcpOutputTokens = $MaxMcpOutputTokens
 $script:RequestedMaxTurns = $MaxTurns
 $script:RequestedMaxBudgetUsd = $MaxBudgetUsd
+$script:RequestedProviderBudgetCny = $ProviderBudgetCny
 $script:LastClaudeExitCode = 0
 
 function Resolve-ClaudeExecutable {
@@ -217,8 +220,11 @@ function Get-ContextProfileArguments {
 function Assert-BoundedInvocation {
     param([string]$ActionName)
 
-    if ($script:RequestedMaxTurns -le 0 -or $script:RequestedMaxBudgetUsd -le 0) {
-        throw "$ActionName requires explicit positive -MaxTurns and -MaxBudgetUsd values. Estimate input, tool, and final-answer cost before invoking Claude."
+    if ($script:RequestedMaxTurns -le 0) {
+        throw "$ActionName requires an explicit positive -MaxTurns value."
+    }
+    if ($script:RequestedMaxBudgetUsd -le 0 -and $script:RequestedProviderBudgetCny -le 0) {
+        throw "$ActionName requires either -ProviderBudgetCny for a post-run DeepSeek cost threshold or -MaxBudgetUsd for Claude Code's internal hard cap."
     }
 }
 
@@ -239,6 +245,101 @@ function Get-UsageSummary {
         cache_creation_input_tokens = $Usage.cache_creation_input_tokens
         cache_read_input_tokens = $Usage.cache_read_input_tokens
         output_tokens = $Usage.output_tokens
+    }
+}
+
+function Get-ProviderPricing {
+    param([string]$ModelName)
+
+    switch -Exact ($ModelName) {
+        'deepseek-v4-flash[1m]' {
+            return [pscustomobject]@{
+                provider = 'DeepSeek'
+                model = 'deepseek-v4-flash[1m]'
+                currency = 'CNY'
+                cache_hit_per_million = [decimal]'0.02'
+                cache_miss_per_million = [decimal]'1'
+                output_per_million = [decimal]'2'
+                verified_on = '2026-07-14'
+            }
+        }
+        'deepseek-v4-pro[1m]' {
+            return [pscustomobject]@{
+                provider = 'DeepSeek'
+                model = 'deepseek-v4-pro[1m]'
+                currency = 'CNY'
+                cache_hit_per_million = [decimal]'0.025'
+                cache_miss_per_million = [decimal]'3'
+                output_per_million = [decimal]'6'
+                verified_on = '2026-07-14'
+            }
+        }
+        default {
+            throw "No audited provider pricing is configured for model: $ModelName"
+        }
+    }
+}
+
+function Get-ProviderCostEstimate {
+    param(
+        [string]$ModelName,
+        $Usage,
+        [decimal]$BudgetCny = 0
+    )
+
+    $pricing = Get-ProviderPricing -ModelName $ModelName
+    $summary = Get-UsageSummary -Usage $Usage
+    $tokenValues = @(
+        $summary.input_tokens,
+        $summary.cache_creation_input_tokens,
+        $summary.cache_read_input_tokens,
+        $summary.output_tokens
+    )
+    if (@($tokenValues | Where-Object { $null -eq $_ }).Count -gt 0) {
+        return [pscustomobject]@{
+            estimated_cost = $null
+            currency = $pricing.currency
+            budget = $(if ($BudgetCny -gt 0) { $BudgetCny } else { $null })
+            budget_type = 'post-run soft threshold'
+            cost_exceeds_budget = $null
+            pricing = $pricing
+            billing_tokens = $null
+            cost_components = $null
+            usage_complete = $false
+            note = 'Estimate unavailable because Claude did not return complete usage. Provider dashboard or invoice is authoritative.'
+        }
+    }
+
+    $tokens = @($tokenValues | ForEach-Object { [decimal]$_ })
+    if (@($tokens | Where-Object { $_ -lt 0 }).Count -gt 0) {
+        throw 'Claude returned a negative token count; provider cost cannot be estimated safely.'
+    }
+    $cacheMissTokens = $tokens[0] + $tokens[1]
+    $cacheMissCost = ($cacheMissTokens * $pricing.cache_miss_per_million) / [decimal]1000000
+    $cacheHitCost = ($tokens[2] * $pricing.cache_hit_per_million) / [decimal]1000000
+    $outputCost = ($tokens[3] * $pricing.output_per_million) / [decimal]1000000
+    $cost = $cacheMissCost + $cacheHitCost + $outputCost
+    $roundedCost = [decimal]::Round($cost, 6, [MidpointRounding]::AwayFromZero)
+
+    return [pscustomobject]@{
+        estimated_cost = $roundedCost
+        currency = $pricing.currency
+        budget = $(if ($BudgetCny -gt 0) { $BudgetCny } else { $null })
+        budget_type = 'post-run soft threshold'
+        cost_exceeds_budget = $(if ($BudgetCny -gt 0) { $roundedCost -gt $BudgetCny } else { $null })
+        pricing = $pricing
+        billing_tokens = [pscustomobject]@{
+            cache_miss = [long]$cacheMissTokens
+            cache_hit = [long]$tokens[2]
+            output = [long]$tokens[3]
+        }
+        cost_components = [pscustomobject]@{
+            cache_miss = [decimal]::Round($cacheMissCost, 9, [MidpointRounding]::AwayFromZero)
+            cache_hit = [decimal]::Round($cacheHitCost, 9, [MidpointRounding]::AwayFromZero)
+            output = [decimal]::Round($outputCost, 9, [MidpointRounding]::AwayFromZero)
+        }
+        usage_complete = $true
+        note = 'Estimate from returned token usage and the audited public DeepSeek price table; provider dashboard or invoice is authoritative.'
     }
 }
 
@@ -539,6 +640,10 @@ switch ($Action) {
             has_output_format           = $mainHelp -match '--output-format'
             bounded_run_supported       = $mainHelp -match '--max-budget-usd' -and $version -ge [version]'2.1.200'
             reply_budget_supported      = $mainHelp -match '--max-budget-usd' -and $version -ge [version]'2.1.200'
+            provider_cost_estimation_supported = $true
+            provider_budget_is_soft     = $true
+            sdk_budget_uses_provider_pricing = $false
+            provider_pricing_models     = @('deepseek-v4-flash[1m]', 'deepseek-v4-pro[1m]')
             max_turns_hidden_supported  = $version -ge [version]'2.1.200'
             background_hard_budget_supported = $false
             native_windows              = $IsWindows
@@ -616,9 +721,8 @@ switch ($Action) {
             $(if ($NoTools) { 'No tools are available. Return only the requested textual response.' })
             '[Task]'
             $taskText
-        ) -join [Environment]::NewLine
+        ) -join ' | '
 
-        $budgetText = $MaxBudgetUsd.ToString([Globalization.CultureInfo]::InvariantCulture)
         $arguments = @(
             '-p',
             '--permission-mode', $permissionMode,
@@ -628,9 +732,12 @@ switch ($Action) {
             '--output-format', 'json',
             '--prompt-suggestions', 'false',
             '--exclude-dynamic-system-prompt-sections',
-            '--max-turns', [string]$MaxTurns,
-            '--max-budget-usd', $budgetText
+            '--max-turns', [string]$MaxTurns
         )
+        if ($MaxBudgetUsd -gt 0) {
+            $budgetText = $MaxBudgetUsd.ToString([Globalization.CultureInfo]::InvariantCulture)
+            $arguments += @('--max-budget-usd', $budgetText)
+        }
         $arguments += @($profile.arguments)
         if ($Ephemeral) {
             $arguments += '--no-session-persistence'
@@ -638,8 +745,7 @@ switch ($Action) {
         if (-not [string]::IsNullOrWhiteSpace($Model)) {
             $arguments += @('--model', $Model)
         }
-        $arguments += $runPrompt
-
+        $arguments += @('--', $runPrompt)
         Push-Location -LiteralPath $resolvedCwd
         try {
             $runResult = Convert-ClaudeJsonResult -Text (Invoke-ClaudeCapture -Arguments $arguments -AllowNonZero -UseToolSearch:$profile.use_tool_search)
@@ -648,6 +754,8 @@ switch ($Action) {
             Pop-Location
         }
         $safeResult = Convert-TerminalLogTail -Raw ([string]$runResult.result) -MaxChars $ReplyMaxChars
+        $usageSummary = Get-UsageSummary -Usage $runResult.usage
+        $providerCost = Get-ProviderCostEstimate -ModelName $Model -Usage $runResult.usage -BudgetCny $ProviderBudgetCny
         [pscustomobject]@{
             action                 = 'run'
             session_id             = $runResult.session_id
@@ -656,12 +764,23 @@ switch ($Action) {
             is_error               = [bool]$runResult.is_error
             num_turns              = $runResult.num_turns
             total_cost_usd         = $runResult.total_cost_usd
-            usage                  = Get-UsageSummary -Usage $runResult.usage
+            sdk_total_cost_usd     = $runResult.total_cost_usd
+            sdk_cost_note          = 'Claude Code internal estimate; not the DeepSeek provider bill.'
+            usage                  = $usageSummary
+            provider_cost_estimate_cny = $providerCost.estimated_cost
+            provider_budget_cny    = $providerCost.budget
+            provider_cost_exceeds_budget = $providerCost.cost_exceeds_budget
+            provider_pricing       = $providerCost.pricing
+            provider_billing_tokens = $providerCost.billing_tokens
+            provider_cost_components_cny = $providerCost.cost_components
+            provider_cost_note     = $providerCost.note
             mode                   = $Mode
             context_profile        = $profile.name
             tool_search_enabled    = [bool]$profile.use_tool_search
             max_turns              = $MaxTurns
             max_budget_usd         = $MaxBudgetUsd
+            sdk_budget_enabled     = $MaxBudgetUsd -gt 0
+            sdk_budget_note        = "Optional Claude Code internal hard cap; it does not use DeepSeek's provider pricing."
             max_mcp_output_tokens  = $script:MaxMcpOutputTokens
             ephemeral              = [bool]$Ephemeral
             no_tools               = [bool]$NoTools
@@ -676,8 +795,8 @@ switch ($Action) {
 
     'start' {
         Assert-ClaudeCapabilities
-        if ($MaxTurns -gt 0 -or $MaxBudgetUsd -gt 0) {
-            throw 'Start uses Claude background mode, which does not support --max-turns or --max-budget-usd. Use run or Claude Code MCP when a hard cap is required.'
+        if ($MaxTurns -gt 0 -or $MaxBudgetUsd -gt 0 -or $ProviderBudgetCny -gt 0) {
+            throw 'Start uses Claude background mode, which does not support per-run turn, SDK budget, or provider-budget thresholds. Use run or Claude Code MCP when bounded accounting is required.'
         }
         if ($Ephemeral) {
             throw 'Ephemeral cannot be combined with a persistent background worker.'
@@ -737,7 +856,7 @@ switch ($Action) {
         if (-not [string]::IsNullOrWhiteSpace($Model)) {
             $arguments += @('--model', $Model)
         }
-        $arguments += $supervisorPrompt
+        $arguments += @('--', $supervisorPrompt)
 
         Push-Location -LiteralPath $resolvedCwd
         try {
@@ -831,6 +950,9 @@ switch ($Action) {
     'reply' {
         Assert-ClaudeCapabilities
         Assert-BoundedInvocation -ActionName 'Reply'
+        if (-not $PSBoundParameters.ContainsKey('Model')) {
+            throw 'Reply requires an explicit -Model so the resumed task is routed deliberately and provider cost uses the correct rate.'
+        }
         Assert-WorkerId -Value $Id
         if ([string]::IsNullOrWhiteSpace($Prompt)) {
             throw 'Reply requires -Prompt.'
@@ -874,7 +996,6 @@ switch ($Action) {
             '[Task]'
             $taskText
         ) -join ' | '
-        $budgetText = $MaxBudgetUsd.ToString([Globalization.CultureInfo]::InvariantCulture)
         $arguments = @(
             '-p',
             '--resume', $sessionId,
@@ -885,15 +1006,17 @@ switch ($Action) {
             '--output-format', 'json',
             '--prompt-suggestions', 'false',
             '--exclude-dynamic-system-prompt-sections',
-            '--max-turns', [string]$MaxTurns,
-            '--max-budget-usd', $budgetText
+            '--max-turns', [string]$MaxTurns
         )
+        if ($MaxBudgetUsd -gt 0) {
+            $budgetText = $MaxBudgetUsd.ToString([Globalization.CultureInfo]::InvariantCulture)
+            $arguments += @('--max-budget-usd', $budgetText)
+        }
         $arguments += @($profile.arguments)
         if (-not [string]::IsNullOrWhiteSpace($Model)) {
             $arguments += @('--model', $Model)
         }
-        $arguments += $followUp
-
+        $arguments += @('--', $followUp)
         Push-Location -LiteralPath $workerCwd
         try {
             $replyResult = Convert-ClaudeJsonResult -Text (Invoke-ClaudeCapture -Arguments $arguments -AllowNonZero -UseToolSearch:$profile.use_tool_search)
@@ -905,6 +1028,8 @@ switch ($Action) {
             throw "Reply returned a different session ID: $($replyResult.session_id)"
         }
         $safeResult = Convert-TerminalLogTail -Raw ([string]$replyResult.result) -MaxChars $ReplyMaxChars
+        $usageSummary = Get-UsageSummary -Usage $replyResult.usage
+        $providerCost = Get-ProviderCostEstimate -ModelName $Model -Usage $replyResult.usage -BudgetCny $ProviderBudgetCny
         [pscustomobject]@{
             id                     = $Id
             session_id             = $sessionId
@@ -919,11 +1044,22 @@ switch ($Action) {
             tool_search_enabled    = [bool]$profile.use_tool_search
             max_turns              = $MaxTurns
             max_budget_usd         = $MaxBudgetUsd
+            sdk_budget_enabled     = $MaxBudgetUsd -gt 0
+            sdk_budget_note        = "Optional Claude Code internal hard cap; it does not use DeepSeek's provider pricing."
             max_mcp_output_tokens  = $script:MaxMcpOutputTokens
             is_error               = [bool]$replyResult.is_error
             num_turns              = $replyResult.num_turns
             total_cost_usd         = $replyResult.total_cost_usd
-            usage                  = Get-UsageSummary -Usage $replyResult.usage
+            sdk_total_cost_usd     = $replyResult.total_cost_usd
+            sdk_cost_note          = 'Claude Code internal estimate; not the DeepSeek provider bill.'
+            usage                  = $usageSummary
+            provider_cost_estimate_cny = $providerCost.estimated_cost
+            provider_budget_cny    = $providerCost.budget
+            provider_cost_exceeds_budget = $providerCost.cost_exceeds_budget
+            provider_pricing       = $providerCost.pricing
+            provider_billing_tokens = $providerCost.billing_tokens
+            provider_cost_components_cny = $providerCost.cost_components
+            provider_cost_note     = $providerCost.note
             result                 = $safeResult.text
             result_source_chars    = $safeResult.source_chars
             result_clean_chars     = $safeResult.clean_chars

@@ -36,12 +36,17 @@ $requiredMarkers = @(
     'ContextProfile',
     'MaxTurns',
     'MaxBudgetUsd',
+    'ProviderBudgetCny',
     'MaxMcpOutputTokens',
     'EnableToolSearch',
     '--max-turns',
     '--max-budget-usd',
     '--no-chrome',
     'total_cost_usd',
+    'provider_cost_estimate_cny',
+    'provider_cost_exceeds_budget',
+    'provider_billing_tokens',
+    'provider_cost_components_cny',
     'result_subtype',
     'usage'
 )
@@ -59,6 +64,9 @@ $result = [ordered]@{
     background_budget_guard = $false
     nonzero_usage_recovery = $false
     missing_usage_recovery = $false
+    provider_cost_estimate = $false
+    provider_soft_budget = $false
+    reply_model_guard = $false
     runtime = -not $SkipRuntime
 }
 
@@ -80,24 +88,6 @@ if (-not $boundaryRejected) {
 $result.installer_boundary = $true
 
 if (-not $SkipRuntime) {
-    $backgroundBudgetRejected = $false
-    try {
-        & $scriptPath -Action start -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'guard probe' -MaxTurns 1 -MaxBudgetUsd 1 | Out-Null
-    }
-    catch {
-        $expectedMessage = 'Start uses Claude background mode, which does not support --max-turns or --max-budget-usd. Use run or Claude Code MCP when a hard cap is required.'
-        if ($_.Exception.Message -ceq $expectedMessage) {
-            $backgroundBudgetRejected = $true
-        }
-        else {
-            throw
-        }
-    }
-    if (-not $backgroundBudgetRejected) {
-        throw 'Background start accepted unsupported hard-budget parameters.'
-    }
-    $result.background_budget_guard = $true
-
     $fakeClaude = Join-Path ([IO.Path]::GetTempPath()) "claude-workforce-fake-$([guid]::NewGuid().ToString('N')).ps1"
     $fakeSource = @'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Remaining)
@@ -117,12 +107,68 @@ if (($Remaining -join ' ') -like '*null usage probe*') {
     '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"22222222-2222-4222-8222-222222222222","total_cost_usd":0.01,"result":"OK"}'
     exit 0
 }
+if (($Remaining -join ' ') -like '*provider soft budget probe*') {
+    $hasSdkBudget = '--max-budget-usd' -in $Remaining
+    $separatorIndex = [Array]::IndexOf($Remaining, '--')
+    $promptFollowsSeparator = $separatorIndex -ge 0 -and ($separatorIndex + 1) -lt $Remaining.Count -and $Remaining[$separatorIndex + 1] -like '*provider soft budget probe*' -and $Remaining[$separatorIndex + 1] -notmatch '[\r\n]'
+    [ordered]@{
+        type = 'result'
+        subtype = 'success'
+        is_error = $false
+        num_turns = 1
+        session_id = '33333333-3333-4333-8333-333333333333'
+        total_cost_usd = 0.25
+        usage = [ordered]@{
+            input_tokens = 100
+            cache_creation_input_tokens = 20
+            cache_read_input_tokens = 30
+            output_tokens = 40
+        }
+        result = "SDK_BUDGET_PRESENT=$hasSdkBudget;PROMPT_AFTER_SEPARATOR=$promptFollowsSeparator"
+    } | ConvertTo-Json -Compress
+    exit 0
+}
 '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":2,"session_id":"11111111-1111-4111-8111-111111111111","total_cost_usd":0.25,"usage":{"input_tokens":100,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40},"result":null}'
 exit 1
 '@
     [IO.File]::WriteAllText($fakeClaude, $fakeSource, [Text.UTF8Encoding]::new($false))
     try {
         $fakeHash = (Get-FileHash -LiteralPath $fakeClaude -Algorithm SHA256).Hash
+        $backgroundBudgetRejected = $false
+        try {
+            & $scriptPath -Action start -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'guard probe' -MaxTurns 1 -MaxBudgetUsd 1 | Out-Null
+        }
+        catch {
+            $expectedMessage = 'Start uses Claude background mode, which does not support per-run turn, SDK budget, or provider-budget thresholds. Use run or Claude Code MCP when bounded accounting is required.'
+            if ($_.Exception.Message -ceq $expectedMessage) {
+                $backgroundBudgetRejected = $true
+            }
+            else {
+                throw
+            }
+        }
+        if (-not $backgroundBudgetRejected) {
+            throw 'Background start accepted unsupported hard-budget parameters.'
+        }
+        $result.background_budget_guard = $true
+
+        $replyModelRejected = $false
+        try {
+            & $scriptPath -Action reply -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'worker-model-guard' -Prompt 'guard probe' -MaxTurns 1 -ProviderBudgetCny ([decimal]'0.01') | Out-Null
+        }
+        catch {
+            if ($_.Exception.Message -ceq 'Reply requires an explicit -Model so the resumed task is routed deliberately and provider cost uses the correct rate.') {
+                $replyModelRejected = $true
+            }
+            else {
+                throw
+            }
+        }
+        if (-not $replyModelRejected) {
+            throw 'Reply silently accepted the default model instead of requiring deliberate routing.'
+        }
+        $result.reply_model_guard = $true
+
         $errorResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'error recovery probe' -NoTools -MaxTurns 2 -MaxBudgetUsd 1 | ConvertFrom-Json)
         if ($errorResult.process_exit_code -ne 1 -or $errorResult.result_subtype -ne 'error_max_turns' -or -not $errorResult.is_error) {
             throw 'Nonzero Claude result metadata was not preserved.'
@@ -130,7 +176,29 @@ exit 1
         if ($errorResult.total_cost_usd -ne 0.25 -or $errorResult.usage.input_tokens -ne 100 -or $errorResult.usage.cache_read_input_tokens -ne 30) {
             throw 'Nonzero Claude usage or cost metadata was not preserved.'
         }
+        if ($errorResult.sdk_total_cost_usd -ne 0.25 -or [decimal]$errorResult.provider_cost_estimate_cny -ne [decimal]'0.000201') {
+            throw 'Provider-aware cost fields were not calculated from usage correctly.'
+        }
+        if ($errorResult.provider_pricing.currency -ne 'CNY' -or $errorResult.provider_pricing.cache_miss_per_million -ne 1) {
+            throw 'Provider pricing metadata is missing or incorrect.'
+        }
+        if ($errorResult.provider_billing_tokens.cache_miss -ne 120 -or $errorResult.provider_billing_tokens.cache_hit -ne 30 -or $errorResult.provider_billing_tokens.output -ne 40) {
+            throw 'Provider billing token buckets were not derived correctly.'
+        }
+        if ([decimal]$errorResult.provider_cost_components_cny.cache_miss -ne [decimal]'0.00012' -or [decimal]$errorResult.provider_cost_components_cny.cache_hit -ne [decimal]'0.0000006' -or [decimal]$errorResult.provider_cost_components_cny.output -ne [decimal]'0.00008') {
+            throw 'Provider cost components were not calculated correctly.'
+        }
+        $result.provider_cost_estimate = $true
         $result.nonzero_usage_recovery = $true
+
+        $providerBudgetResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'provider soft budget probe' -NoTools -MaxTurns 1 -ProviderBudgetCny ([decimal]'0.0001') | ConvertFrom-Json)
+        if ($providerBudgetResult.result -ne 'SDK_BUDGET_PRESENT=False;PROMPT_AFTER_SEPARATOR=True' -or $providerBudgetResult.sdk_budget_enabled) {
+            throw 'Provider-only budget enabled the SDK budget or the current prompt was not isolated after the option terminator.'
+        }
+        if (-not $providerBudgetResult.provider_cost_exceeds_budget -or $providerBudgetResult.provider_budget_cny -ne [decimal]'0.0001') {
+            throw 'Provider soft-budget status was not reported correctly.'
+        }
+        $result.provider_soft_budget = $true
 
         $missingUsageResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'null usage probe' -NoTools -MaxTurns 1 -MaxBudgetUsd 1 | ConvertFrom-Json)
         if ($missingUsageResult.result_subtype -ne 'success' -or $missingUsageResult.result -ne 'OK') {
@@ -157,6 +225,12 @@ exit 1
     }
     if (-not $capabilities.bounded_run_supported -or -not $capabilities.reply_budget_supported) {
         throw 'Bounded run and reply budget support must be reported.'
+    }
+    if (-not $capabilities.provider_cost_estimation_supported -or -not $capabilities.provider_budget_is_soft -or $capabilities.sdk_budget_uses_provider_pricing) {
+        throw 'Provider-aware cost capability metadata is incorrect.'
+    }
+    if ('deepseek-v4-flash[1m]' -notin @($capabilities.provider_pricing_models) -or 'deepseek-v4-pro[1m]' -notin @($capabilities.provider_pricing_models)) {
+        throw 'Provider pricing model capability metadata is incomplete.'
     }
     if ($capabilities.default_context_profile -ne 'auto' -or $capabilities.default_mcp_output_tokens -ne 10000) {
         throw 'Cost-control defaults drifted from the documented profile.'
