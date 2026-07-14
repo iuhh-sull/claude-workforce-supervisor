@@ -112,9 +112,14 @@ foreach ($tool in @('Read', 'Glob', 'Grep', 'WebSearch', 'Plan', 'EnterPlanMode'
         throw "MCP profile is missing expected low-risk allow rule: $tool"
     }
 }
-foreach ($tool in @('Bash', 'Edit', 'Write', 'NotebookEdit', 'WebFetch', 'Agent')) {
+foreach ($tool in @('Bash', 'Edit', 'Write', 'NotebookEdit', 'WebFetch', 'Agent', 'Task')) {
     if ($tool -notin @($mcpProfile.settings.permissions.ask)) {
         throw "MCP profile is missing expected review rule: $tool"
+    }
+}
+foreach ($tool in @('Bash', 'Edit', 'Write', 'NotebookEdit', 'WebFetch', 'Agent', 'Task')) {
+    if ($tool -in @($mcpProfile.settings.permissions.allow)) {
+        throw "Dangerous bare tool must not appear in allow of normal session profile: $tool"
     }
 }
 foreach ($rule in @('Read(**/.env)', 'Read(~/.codex/auth.json)', 'Read(~/.claude/settings.json)')) {
@@ -126,6 +131,11 @@ $nestedProfile = & $profilePath -Output mcp -ContextProfile project -AllowNested
 if ('Agent' -notin @($nestedProfile.settings.permissions.allow) -or 'Agent' -in @($nestedProfile.settings.permissions.ask) -or
     'Task' -notin @($nestedProfile.settings.permissions.allow) -or 'Task' -in @($nestedProfile.settings.permissions.ask)) {
     throw 'Explicit nested-agent authorization was not scoped into the MCP session profile.'
+}
+foreach ($tool in @('Bash', 'Edit', 'Write', 'NotebookEdit', 'WebFetch')) {
+    if ($tool -in @($nestedProfile.settings.permissions.allow)) {
+        throw "AllowNestedAgents must not move dangerous tool into allow: $tool"
+    }
 }
 $result.mcp_profile = $true
 

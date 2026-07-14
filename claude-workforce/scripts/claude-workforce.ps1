@@ -321,7 +321,21 @@ function Get-ProviderPricing {
                 cache_miss_per_million = [decimal]'1'
                 output_per_million = [decimal]'2'
                 verified_on = '2026-07-14'
-                rate_note = 'Static audited rates as of verified_on. Rates are subject to change. Provider dashboard or invoice is authoritative for actual billing.'
+                rate_note = 'Static audited off-peak rates as of verified_on. Rates are subject to change. Provider dashboard or invoice is authoritative for actual billing.'
+                peak_pricing = [pscustomobject]@{
+                    status = 'announced_not_yet_applied'
+                    announced_date = '2026-06-29'
+                    planned_activation = 'mid-July 2026'
+                    peak_hours_beijing = '09:00-12:00, 14:00-18:00'
+                    peak_multiplier = 2
+                    source_type = 'community_corroboration'
+                    sources = @(
+                        'https://platform.deepseek.com/pricing (official pricing page — verify activation status)',
+                        'https://m.ithome.com/html/970123.htm (IT之家 2026-06-30)',
+                        'https://wallstreetcn.com/articles/3775761 (华尔街见闻 2026-06-29)'
+                    )
+                    note = 'Peak pricing announced via official developer email but NOT independently confirmed as active on platform.deepseek.com/pricing. Current cost estimates use off-peak rates only. Verify activation on official pricing page before applying peak multiplier.'
+                }
             }
         }
         'deepseek-v4-pro[1m]' {
@@ -333,7 +347,21 @@ function Get-ProviderPricing {
                 cache_miss_per_million = [decimal]'3'
                 output_per_million = [decimal]'6'
                 verified_on = '2026-07-14'
-                rate_note = 'Static audited rates as of verified_on. Rates are subject to change. Provider dashboard or invoice is authoritative for actual billing.'
+                rate_note = 'Static audited off-peak rates as of verified_on. Rates are subject to change. Provider dashboard or invoice is authoritative for actual billing.'
+                peak_pricing = [pscustomobject]@{
+                    status = 'announced_not_yet_applied'
+                    announced_date = '2026-06-29'
+                    planned_activation = 'mid-July 2026'
+                    peak_hours_beijing = '09:00-12:00, 14:00-18:00'
+                    peak_multiplier = 2
+                    source_type = 'community_corroboration'
+                    sources = @(
+                        'https://platform.deepseek.com/pricing (official pricing page — verify activation status)',
+                        'https://m.ithome.com/html/970123.htm (IT之家 2026-06-30)',
+                        'https://wallstreetcn.com/articles/3775761 (华尔街见闻 2026-06-29)'
+                    )
+                    note = 'Peak pricing announced via official developer email but NOT independently confirmed as active on platform.deepseek.com/pricing. Current cost estimates use off-peak rates only. Verify activation on official pricing page before applying peak multiplier.'
+                }
             }
         }
         default {

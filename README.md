@@ -104,9 +104,24 @@ After a failed CC call, review model, effort, context scope, tool turns, budget,
 
 `new-workforce-session-profile.ps1` builds temporary, session-scoped settings shared by the MCP and Agent View paths. It never writes to `~/.claude/settings.json`, so a normal interactive `claude` session keeps the user's own model and permission defaults.
 
-Read, Glob, Grep, WebSearch, and Plan are pre-authorized. Sensitive paths such as credential stores, private keys, `.env`, and user auth/settings files are covered by higher-priority ask rules. A worker may read user configuration only when the current task authorizes it, and must not echo or transmit secret values.
+**Permission layers in this profile:**
 
-Shell commands, Edit, Write, NotebookEdit, each WebFetch target, Agent, and side-effecting MCP tools are surfaced through the permission proxy. Codex may approve a public URL or a clearly read-only shell/Git inspection directly; writes, outbound local data, authentication, installation, publishing, and deployment require an input-specific decision.
+| Layer | Meaning | Example |
+|-------|---------|---------|
+| **tools** | Capability exists in the runtime. | `Read`, `Bash`, `Agent` are all present. |
+| **allow** | Pre-authorized — runs without per-invocation approval. | `Read`, `Glob`, `Grep`, `WebSearch`, `Plan`. |
+| **ask** | Per-invocation review via `canUseTool` → Codex. | `Bash`, `Edit`, `Write`, `WebFetch`, `Agent`, `Task`. |
+| **deny** | Hard block — cannot be used regardless of other rules. | Kept empty; truly unacceptable actions are refused by Codex. |
+
+Sensitive-path Read rules (`.env`, `auth.json`, `settings.json`, private keys) are placed in **ask** with higher priority than the broad `Read` **allow**, so they still trigger per-invocation review even though `Read` is pre-authorized.
+
+This profile does not use `bypassPermissions`, `acceptEdits`, `dontAsk`, or any form of skip-permissions. Every write, shell command, web fetch target, and nested agent remains reviewable.
+
+Read, Glob, Grep, WebSearch, and Plan are pre-authorized. Shell commands, Edit, Write, NotebookEdit, each WebFetch target, Agent, and side-effecting MCP tools are surfaced through the permission proxy. Codex may approve a public URL or a clearly read-only shell/Git inspection directly; writes, outbound local data, authentication, installation, publishing, and deployment require an input-specific decision.
+
+## Extending to a new provider
+
+Adding a new LLM provider requires adapting the model ID mapping, effort/thinking controls, usage field extraction, and cost calculation. The wrapper's deterministic pricing functions are provider-specific; audit the provider's current token rates and billing fields before enabling cost estimation.
 
 MCP calls leave top-level `allowedTools` and `disallowedTools` empty. The maintained `claude-code-mcp` permission proxy uses `canUseTool`, `claude_code_check`, and `respond_permission` to present each unresolved action to the supervisor. Approvals are for the current request and are not written back as persistent Claude settings.
 

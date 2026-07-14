@@ -46,14 +46,18 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action capabil
 
 **临时 `--settings` 与 MCP 中间层：**
 
-- **allow**：Read、Glob、Grep、WebSearch、Plan/EnterPlanMode/ExitPlanMode，以及精确命名的公开搜索 MCP。Plan 是工作方式，不是风险动作。
-- **ask**：Bash、Edit、Write、NotebookEdit、WebFetch、Agent/Task、任意 URL 抓取和 context execute MCP；`.env`、认证配置、私钥、Codex/Claude settings 等敏感 Read 规则也放在 ask 中，优先于宽泛 Read allow。
-- **deny**：正常 profile 保持空。任务可能需要的能力不做永久封死；真正不可接受的具体请求由 Codex 拒绝。
+- **allow**：Read、Glob、Grep、WebSearch、Plan/EnterPlanMode/ExitPlanMode，以及精确命名的公开搜索 MCP。Plan 是工作方式，不是风险动作。**注意**：allow 是免审批预授权（工具存在且本次直接放行），与工具的单纯存在（tools）不同。
+- **ask**：Bash、Edit、Write、NotebookEdit、WebFetch、Agent/Task、任意 URL 抓取和 context execute MCP；`.env`、认证配置、私钥、Codex/Claude settings 等敏感 Read 规则也放在 ask 中，优先于宽泛 Read allow。**注意**：ask 通过 `canUseTool` 向 Codex 逐次审批；宽泛 Read 虽在 allow，但敏感路径 Read 规则在 ask 中且优先级更高，因此仍会触发审批。
+- **deny**：正常 profile 保持空。**注意**：deny 是硬阻断，被 deny 的工具即使 ask/allow 规则匹配也无法使用。任务可能需要的能力不做永久封死；真正不可接受的具体请求由 Codex 拒绝。
 - **MCP 顶层工具表**：`allowedTools=[]`、`disallowedTools=[]`、`strictAllowedTools=false`，复用社区维护的 `claude-code-mcp` 的 `canUseTool`、`claude_code_check`、`respond_permission` 流程，不自制 shell/URL 权限解析器。Codex 可直接批准公开 URL、只读 Git/目录检查等低风险请求；写入、敏感读取、本地数据外发、认证、安装、发布和部署按具体输入审批。
 - **Agent**：默认 ask；显式 `-AllowNestedAgents` 时只在当前员工会话改为 allow。是否开启取决于任务能否独立并行以及总成本，而不是一律禁止。
 - **兼容键**：`AllowBroadWebFetch` 仍可被旧私有配置解析，但不再改变权限。公共 WebFetch 可由 MCP 主管快速批准，回环、私网、带凭据或可能外发本地数据的目标继续拦截。
 
 Claude Code 官方权限文档说明：匹配的 ask/deny 规则仍优先于 hook allow；本项目因此不叠加自制 PreToolUse/PermissionRequest hook。CC、wrapper 或 MCP 更新后要重跑真实权限探针，确认没有静默预批准。
+
+**Effort levels**: Claude Code CLI 接受 `low`、`medium`、`high`、`xhigh`、`max`。官方 Agent SDK `EffortLevel` 定义包含全部五档，参见 [`claude-agent-sdk-python/types.py`](https://raw.githubusercontent.com/anthropics/claude-agent-sdk-python/refs/heads/main/src/claude_agent_sdk/types.py)——该文档仅作为 Claude Code 客户端接受这些 effort 值的证据。workforce wrapper 的 `-Effort` 参数接受全部五档，这是客户端参数兼容。**本项目实际使用的模型始终是 `deepseek-v4-flash[1m]` / `deepseek-v4-pro[1m]` 自定义 provider**；DeepSeek 后端对 `xhigh` 的实际推理语义尚未经过本地兼容探针验证，需要当前 provider/proxy 环境下实测确认。不得因此切换或调用 Anthropic 官方 Claude 模型。
+
+**Adding a new provider**: requires adapting model ID mapping, effort/thinking controls, usage-field extraction, and provider-specific cost calculation. Audit the provider's current token rates and billing fields before enabling `-ProviderBudgetCny` estimation.
 
 **工具可用性：**
 
