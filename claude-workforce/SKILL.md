@@ -29,11 +29,11 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action capabil
 
 ## 权限模型
 
-**核心理念：Codex 可以授权 CC；除明确预授权的纯公开知识检索外，CC 启动时未预授权的权限必须请求。** 不通过 `--tools` 删除工具来限制能力——员工拥有完整工具集，但每项敏感操作都通过 `--settings` 中的 `permissions.ask` 或 `permissions.deny` 规则控制。
+**核心理念：Codex 可以授权 CC；未被当前 workforce profile 预授权的动作通过 MCP 中间层交给 Codex 判断。** 正常任务不通过 `--tools` 删除工具；`-NoTools` 只用于可丢弃的无工具冒烟。
 
 权限按能力、数据敏感度、目标和副作用分级，不做全 deny 或全 allow。公开只读检索可预授权，只读用户配置需脱敏；写入、外发、认证、安装、发布和破坏性操作按当前具体请求审批。只有无法安全约束或明确不可接受的动作才进入 deny。
 
-本技能的模型、Effort、联网和权限规则只通过启动参数及临时 `--settings` 作用于 Codex 派出的 workforce 会话，不改动用户日常直接运行 `claude` 时的默认模型或权限。员工可以只读并遵循用户全局配置，但不得在没有当前任务明确授权时修改；即使读取到敏感值，也不得回显或外发。
+本技能的模型、Effort、联网和权限规则由 `new-workforce-session-profile.ps1` 临时生成，只作用于 Codex 派出的 MCP/Agent View 会话，不改动用户日常直接运行 `claude` 时的默认模型或权限。员工可以只读并遵循用户全局配置，但不得在没有当前任务明确授权时修改；即使读取到敏感值，也不得回显或外发。
 
 **权限模式：**
 
@@ -42,21 +42,22 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action capabil
 | `inspect` | `plan` | 只读为主；编辑操作需请求 |
 | `write` | `default` | 可提议编辑；每次编辑都需请求授权 |
 
-> ⚠️ `write` 模式绝不使用 `acceptEdits` / `auto` / `dontAsk` / `bypassPermissions`。即使用户的全局配置允许自动编辑，临时 `--settings` 中的 `ask` 规则也会覆盖，强制请求。
+> ⚠️ `write` 模式不使用 `acceptEdits` / `auto` / `dontAsk` / `bypassPermissions`。当前 DeepSeek 自定义 provider 也不满足官方 `auto` 模式的适用条件。
 
-**`--settings` 注入的权限规则（临时，仅该员工会话有效）：**
+**临时 `--settings` 与 MCP 中间层：**
 
-- **deny（硬拦截）**：`git push/commit`、`gh pr`、`npm/pnpm/yarn publish`；读取、编辑或写入 `.env`、常见认证配置、凭据清单和私钥文件；默认 deny `Agent`。这些是少量永不在 workforce 会话内执行的纵深防线，若用户确需操作，应回到 Codex 主任务重新确认并使用独立受控流程。
-- **allow（默认放行）**：只放行无需指定任意目标 URL 的公开检索：原生 `WebSearch`、Exa search、Tavily search/research。MCP 名称使用运行时已验证的精确名称，不使用宽泛通配。
-- **ask（请求授权）**：`Bash`、`Edit`、`Write`、`NotebookEdit`，以及可接收任意 URL 的 WebFetch、Exa fetch、Tavily extract/map/crawl、context-mode fetch。这样不会把联网一刀切关闭，但访问具体目标前仍能审查是否为回环、私网、认证或含凭据地址。
-- **可选宽松抓取**：只有受信环境明确配置 `AllowBroadWebFetch = $true` 或启动时加 `-AllowBroadWebFetch`，才把上述 URL 抓取工具从 ask 移到 allow；这不会放开 Bash、浏览器交互、认证或远端写入。
-- **Agent**：默认在 deny 中（禁止嵌套子代理）。仅显式 `-AllowNestedAgents` 时从 deny 移到 ask（允许但每次请求）。`permissions.allow` 只包含上述精确的公开知识检索工具。
+- **allow**：Read、Glob、Grep、WebSearch、Plan/EnterPlanMode/ExitPlanMode，以及精确命名的公开搜索 MCP。Plan 是工作方式，不是风险动作。
+- **ask**：Bash、Edit、Write、NotebookEdit、WebFetch、Agent/Task、任意 URL 抓取和 context execute MCP；`.env`、认证配置、私钥、Codex/Claude settings 等敏感 Read 规则也放在 ask 中，优先于宽泛 Read allow。
+- **deny**：正常 profile 保持空。任务可能需要的能力不做永久封死；真正不可接受的具体请求由 Codex 拒绝。
+- **MCP 顶层工具表**：`allowedTools=[]`、`disallowedTools=[]`、`strictAllowedTools=false`，复用社区维护的 `claude-code-mcp` 的 `canUseTool`、`claude_code_check`、`respond_permission` 流程，不自制 shell/URL 权限解析器。Codex 可直接批准公开 URL、只读 Git/目录检查等低风险请求；写入、敏感读取、本地数据外发、认证、安装、发布和部署按具体输入审批。
+- **Agent**：默认 ask；显式 `-AllowNestedAgents` 时只在当前员工会话改为 allow。是否开启取决于任务能否独立并行以及总成本，而不是一律禁止。
+- **兼容键**：`AllowBroadWebFetch` 仍可被旧私有配置解析，但不再改变权限。公共 WebFetch 可由 MCP 主管快速批准，回环、私网、带凭据或可能外发本地数据的目标继续拦截。
 
-该优先级来自当前 Claude Code 官方权限规则，是本技能的显式兼容依赖；CC、wrapper 或 MCP 更新后仍需运行真实权限探针，确认未出现静默预批准。
+Claude Code 官方权限文档说明：匹配的 ask/deny 规则仍优先于 hook allow；本项目因此不叠加自制 PreToolUse/PermissionRequest hook。CC、wrapper 或 MCP 更新后要重跑真实权限探针，确认没有静默预批准。
 
 **工具可用性：**
 
-- 正常模式（`inspect` / `write`）：**不传 `--tools`**——员工拥有 Claude Code 完整内置工具集。所有工具的权限由上述 deny/ask 规则和 permission mode 共同决定。
+- 正常模式（`inspect` / `write`）：**不传 `--tools`**——员工拥有 Claude Code 完整内置工具集。工具权限由 session settings、permission mode 和 MCP 的逐次审批共同决定。
 - `-NoTools`：仅 `inspect` 模式可用。传 `--tools ''` + `--disable-slash-commands` + `--strict-mcp-config`，完全移除内置工具、slash commands 和 MCP。
 
 **MCP 继承：**
@@ -69,7 +70,7 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action capabil
 
 ### 调用门槛
 
-调用前先估算净收益，比较 Codex 直接完成与“CC 执行 + MCP/worker 轮询 + Codex 复核 + 可能返工”的总成本。满足下列任一条件且预期返工较低时，才优先调用 CC：
+调用前先估算净收益，比较 Codex 直接完成与“CC 执行 + MCP/worker 轮询 + Codex 复核 + 可能返工”的总成本。DeepSeek 实际价格显著低于 Codex 稀缺额度时，只要任务边界清楚、结果可压缩且不涉及敏感审批，就默认优先调用 CC；下列是明确应委派场景，不是最低门槛：
 
 跨模型评估必须分账：节省 Codex/GPT 配额是主指标，DeepSeek/CC tokens 和费用是独立副指标，不能直接相加。净节省只计算“CC 避免的 Codex 输入、输出和工具回灌”减去“Codex 派单、轮询、定点复核和返工”；若 Codex 最后仍通读同一批大材料，该调用只能记为质量交叉审查，不能记为节省额度。
 
@@ -81,8 +82,8 @@ wrapper 已为两个 DeepSeek V4 模型加入确定性 CNY 估算：缓存未命
 
 `-ProviderBudgetCny` 是调用结束后核验的软阈值，不会中途终止进程。`-MaxBudgetUsd` 仍按 Claude Code 的内置美元估值触发，只是可选的 SDK 硬闸；在自定义 DeepSeek provider 下不代表实际美元消费。默认优先使用 `MaxTurns`、严格工具/读取范围、输出上限和 `ProviderBudgetCny`，避免错误 Opus 价在最终交付前截断；确需纵深止损时才另外给足够宽的 `MaxBudgetUsd`。
 
-- 需要处理约 5k tokens 以上原始材料，CC 可以只返回 1k-2k tokens 的证据摘要。
-- 涉及三个以上文件的检索、分类、机械审查或一致性修改。
+- 需要处理约 3k tokens 以上原始材料，CC 可以只返回 1k-2k tokens 的证据摘要。
+- 涉及两个以上文件的检索、分类、机械审查或一致性修改。
 - 需要在单个巨大、压缩或生成文件中定向搜索，或要完成两个以上彼此独立的只读检索，Codex 只需接收证据索引。
 - 需要生成长文初稿、跨来源摘要、批量文本、重复性代码或测试样板，并能让 CC 直接落盘后只回报 diff 和验证结果。
 - 工作会产生大量搜索、日志、测试或文件读取输出，但 Codex 主对话只需要带路径/行号/URL的结构化摘要。
@@ -92,14 +93,14 @@ wrapper 已为两个 DeepSeek V4 模型加入确定性 CNY 估算：缓存未命
 
 以下任务默认由 Codex 直接处理，不调用 CC：
 
-- 两个以内普通文件、约 3k tokens 以内相关上下文、一步可验收的小补丁；巨大/压缩/生成文件不按文件数豁免。
+- 单个很短文件、约 1k tokens 以内相关上下文、一步可验收且派单与复核明显更贵的小补丁；巨大/压缩/生成文件不按文件数豁免。
 - 全局配置、权限策略、密钥边界、发布、提交、推送、部署和其他高风险或外部副作用操作。
 - CC 的产物仍需 Codex 逐行重做、无法压缩返回，或预计轮询与复核成本不低于直接完成。
 - 需要频繁来回澄清、多个阶段共享大量上下文、步骤强顺序依赖，或多个员工会同时修改同一文件。
 - 子任务必须互相通信、协商或共享不断变化的状态；普通 subagent/worker 只适合清晰 handoff，不适合隐式协同。
 - 任务边界尚未明确，或关键选择会实质改变结果。先由 Codex 澄清或收敛范围。
 
-这些数量是默认止损线，不是机械门槛。用户明确要求调用 CC 时可以调用，但仍须使用最小范围、有限预算和完整提示词合同；若判断明显不省成本，应先向用户说明。
+这些数量是默认路由线，不是机械门槛。DeepSeek 单价显著低于 Codex 稀缺额度时，应优先委派可压缩返回的低敏执行工作；用户明确要求调用 CC 时优先寻找合适子任务。仍须使用边界明确的范围、足以完成交付的有限预算和完整提示词合同；止损依据是范围漂移、重复读取、无进展、不可压缩返工和真实供应商费用，而不是孤立的 DS token 数。
 
 CC 返回后，Codex 默认只读它给出的证据索引、命中行、最终 diff、测试失败点和不确定项，不再通读原始材料。只有安全/权限/密钥/发布、证据冲突、测试失败或定点抽样发现错误时，才扩大到相关局部；必须记录扩大读取的触发原因。高风险验收需要检查原始 diff，不等于重读 CC 已扫描的全部仓库或资料。
 
@@ -109,11 +110,13 @@ CC 返回后，Codex 默认只读它给出的证据索引、命中行、最终 d
 
 - 调研、诊断、审查、制定方案：`-Mode inspect`（`plan` 权限模式）。员工可读取并直接使用预授权的公开知识检索；Bash/Edit/Write、浏览器交互和其他敏感操作仍需请求授权。
 - 用户明确要求修改代码：`-Mode write`（`default` 权限模式）。员工可提议编辑，但每次 Edit/Write/Bash 都需请求授权。
-- 默认禁止员工再启动嵌套子代理（`Agent` 在 deny 中）。只有用户明确批准额外并行成本和扩大任务面后才加 `-AllowNestedAgents`（Agent 从 deny 移到 ask）。
+- Agent 默认 ask。只有额外并行确实能降低总交付成本、任务范围清楚时才加 `-AllowNestedAgents`，在当前员工会话中改为 allow。
 - 非 Git 目录写入：只有用户明确同意无 worktree 隔离后才加 `-AllowUnisolatedWrite`。
 - 纯连通性测试使用 `-NoTools`；该模式只允许 `inspect`，移除全部内置工具、slash commands 和 MCP。
 
 **模型与 Effort 路由**：Flash 只用于检索初筛、提取、格式化、冒烟和可机械验证的检查；设计、debug、代码修改方案、兼容性、安全审查、架构判断和最终验收，只要错误会带来明显返工，就使用 `deepseek-v4-pro[1m]` + `high`。高风险、多约束且 high 明显不足时才用 `max`。纯连通性测试使用 flash + `low`。选择模型时优先比较错误与返工成本，不能只为降低单次 token 费用而降档；续接会话也按当前增量任务重新选择。
+
+每次 CC 调用失败或结果不可用时，故障记录必须额外判断模型和 Effort 是否匹配，并与上下文范围、工具轮次、预算、输出余量、provider/CLI 状态分别归因。机械任务因读取范围或轮次不足失败时，先用本地代码切片、缩小工具面或续接原会话，不得把升级 Pro/max 当作默认修复；只有证据表明推理质量不足时才升档。
 
 启动或续接前必须根据当前增量任务写明模型与 Effort 的选择理由。不要因为任务篇幅长就直接使用 pro/high，也不要因任务表面简单就忽略事实核验风险：大批量低风险文本处理优先 flash/medium；需要跨文件推理、处理相互冲突的约束或作出高影响判断时再升到 pro/high；`max` 仅用于错误代价高、约束复杂且 high 明显不足的任务。高强度阶段结束后，后续机械修改和格式检查应降档或交回 Codex，避免整段会话持续使用高档位。
 
@@ -121,7 +124,7 @@ CC 返回后，Codex 默认只读它给出的证据索引、命中行、最终 d
 
 **成本控制**：高推理档位只提高推理标准，不授权无限上下文、无限轮次或无边界子代理。派单必须限定范围、证据来源和输出格式，优先复用既有会话、摘要与索引；只有可独立并行且预期收益明确时才启用 `-AllowNestedAgents`，禁止重复抓取、反复读取大文件、无进展轮询和无关扩张。
 
-一次性任务使用 `run` 或 Claude Code MCP，并显式设置有限的 `MaxTurns`、返回大小和 DeepSeek `ProviderBudgetCny` 软阈值。`MaxBudgetUsd` 仅在确需 Claude SDK 内部硬闸时启用，不能用它表示 DeepSeek 实际费用。官方后台 `--bg` 不支持这些逐次边界，因此 `start` 不得声称或模拟硬预算；后台员工要拆成可验收阶段并按状态 stop。连续两个实质回合重复读取或重复结论、开始修改范围外文件、擅自删减要求，或预计返工成本已超过 Codex 直接完成时，停止会话并由 Codex 接管。
+一次性任务使用 `run` 或 Claude Code MCP，并显式设置有限的 `MaxTurns`、返回大小和 DeepSeek `ProviderBudgetCny` 软阈值。`MaxTurns` 至少覆盖预计工具调用数并额外预留 2 个收尾回合；多文件搜证通常从 8-20 回合起估，测试阶段可按常规值的 1.5-2 倍放宽，再按工具链增减，不能在已支付读取成本后截掉最终回答。`MaxBudgetUsd` 仅在确需 Claude SDK 内部硬闸时启用，不能用它表示 DeepSeek 实际费用。官方后台 `--bg` 不支持这些逐次边界，因此 `start` 不得声称或模拟硬预算；后台员工要拆成可验收阶段并按状态 stop。连续两个实质回合重复读取或重复结论、开始修改范围外文件、擅自删减要求，或预计返工成本已超过 Codex 直接完成时，停止会话并由 Codex 接管。
 
 预算上限必须根据预计输入 token、缓存读取、工具轮次和输出规模估算，并留出完成最终回答的余量。不要给需要读取长日志或大 transcript 的任务设置无法覆盖首次完整处理的低预算；这类任务优先使用可信的结构化用量工具（如 `ccusage --json`）或本地确定性代码提取、去重并汇总 `input/output/cache creation/cache read`，再让 CC 只判断压缩后的元数据。发生 budget error 或状态异常时，先记录 result subtype、`session_id`、usage、费用和轮次，再用 session metadata 与一次最小 `poll` 取回可复用输出；只有确认无法恢复时才补充调用，禁止不看结果就直接重跑。用量审计必须区分“增加”“减少”和“证据不足”，不得把缺失数据解释为持平。
 
@@ -129,11 +132,13 @@ CC 返回后，Codex 默认只读它给出的证据索引、命中行、最终 d
 
 **上下文档位**：`auto` 在 `NoTools` 时选择 `minimal`，其他任务选择 `project`。`minimal` 使用 safe mode，关闭 hooks、skills、plugins、MCP、memory 和 CLAUDE.md；`user` 只加载用户级配置并禁用 MCP，适合明确需要用户 skill 的文案工作；`project` 加载 user/project 规则并禁用 MCP，适合大多数代码和内置 WebSearch 调研；`full` 才继承全部 local 配置和 MCP。只有任务确实需要 MCP 时才使用 `full`。
 
-直接通过 Claude Code MCP 启动自定义 provider 时，不要为省上下文盲目设置 `settingSources=[]`：若认证链依赖 user settings，这会在推理前产生 401。先用无敏感输出的认证探针确认；需要 user settings 时保留 `settingSources=[user]`，再通过 `tools`、`strictAllowedTools`、短 prompt 和输出上限削减上下文。严格工具列表只能使用运行时目录中的精确名称；已有 `strictAllowedTools=true` 时不要再添加不存在的冗余 deny 工具。
+直接通过 Claude Code MCP 启动自定义 provider 时，不要为省上下文盲目设置 `settingSources=[]`：若认证链依赖 user settings，这会在推理前产生 401。先用无敏感输出的认证探针确认；需要 user settings 时保留 `settingSources=[user]`，再通过 `tools`、`strictAllowedTools`、短 prompt 和输出上限削减上下文。严格工具列表只能使用运行时目录中的精确名称；已有 `strictAllowedTools=true` 时不要再添加不存在的冗余 deny 工具。`strictAllowedTools` 只约束实际可调用权限，不保证其他 MCP 工具不会被运行时展示或尝试；必须同时核对权限结果。
+
+用户明确授权的非敏感本地摘要、usage、错误日志片段或项目文件，可临时按精确工具名和精确路径放行 context-mode 读取/确定性计算，让 CC 直接返回压缩结论。该授权不得扩展到凭据目录、全盘扫描、任意命令、写入、联网外发、认证或发布；含敏感值的配置仍由 Codex 脱敏或定点核验。
 
 Claude Code 在自定义 `ANTHROPIC_BASE_URL` 下可能默认把 MCP schema 全量注入。`EnableToolSearch` 必须先用真实 MCP 调用验证兼容性，通过后再启用；它只在 `full` 档位且未使用 `NoTools` 时生效。不兼容时回退到 `project` 或显式最小 MCP 配置，不得盲目强制。wrapper 默认把 `MAX_MCP_OUTPUT_TOKENS` 设为 10000，长结果优先落盘后只返回路径、摘要和验证结论。
 
-回合预算必须覆盖完整工具链：无工具短任务通常只需 1 回合；一次公开搜索至少需要 4 回合，给工具发现、工具执行和最终回答留出余量；多工具任务按实际链路增加。`error_max_turns`、`error_max_budget_usd` 等非零退出仍要解析并返回 subtype、session、cost 和 usage，不能先抛异常丢掉证据。
+回合预算必须覆盖完整工具链：无工具短任务通常需 2 回合；1-2 文件机械读取常规 4-6、测试期 6-10 回合；3-8 文件搜证常规 8-12、测试期 12-20 回合；仓库级只读审查常规 12-20、测试期 20-30 回合；复杂 Pro/high 或 Pro/max 任务可从 20-30 回合起估。一次公开搜索至少需要 4 回合，始终额外预留至少 2 个收尾回合；多工具任务按实际链路增加。`error_max_turns`、`error_max_budget_usd` 等非零退出仍要解析并返回 subtype、session、cost 和 usage，不能先抛异常丢掉证据。
 
 **Claude Code MCP 轮询**：正常监控使用 `responseMode=minimal` 或 `delta_compact`，`includeActions=true`、`includeResult=true`，并关闭普通 events、progress events、terminal events、structured output 和中间 usage。给用户的初始 ETA 可按 Flash/low 20-60 秒、Flash/medium 1-3 分钟、Pro/high 3-8 分钟、Pro/max 或多工具 5-15 分钟估计，再按实测调整。遵守 MCP 返回的 `pollInterval`，除权限即将超时、状态已接近终态或用户明确要求外，不高频空轮询；等待期间继续处理可独立的本地工作。只有诊断 MCP、hook 或权限协议时才临时打开所需事件，并设置 `maxBytes` / `maxEvents`。不得把模型思考、完整 hook 输出、重复工具事件或整段 transcript 回灌到 Codex 上下文。
 
@@ -155,7 +160,7 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action start -
 
 **`run`、`start` 和 `reply` 在调用前强制检查**：验证 Claude Code 版本 >= 2.1.200、agents 子命令支持 JSON/permission mode、主命令支持 JSON 输出和预算。当前 CLI 接受 `--max-turns` 但可能不在 `--help` 中展示，因此以版本下限和真实冒烟测试共同确认，不做 help-only 误判。不满足条件时立即报错，不会仅在 `capabilities` 中报告。
 
-不要在 prompt 中放 token、密码、私有端点或身份信息。脚本会附加禁止提交、推送、发布、部署、开 PR、删除 worktree、访问专用凭据库和抓取私网目标的约束，并用权限 deny/ask 规则实施分级控制。
+不要在 prompt 中放 token、密码、私有端点、仓库 remote、分支名或身份信息。脚本会附加禁止提交、推送、发布、部署、开 PR、删除 worktree、访问专用凭据库和抓取私网目标的约束，并用 session ask/allow 与 MCP 逐次审批实施分级控制。敏感 Read 一旦获批，内容可能进入持久 transcript；批准前必须确认任务必要性和输出脱敏。
 
 ## 监控与验收
 
@@ -192,6 +197,8 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action logs -I
 
 `logs` 默认上限 8000 字符（`-LogTailChars` 可调整，范围 1000-50000）。`reply` 结果默认上限 4000 字符（`-ReplyMaxChars` 可调整，范围 500-20000）。只有确有必要时才提高上限，禁止把完整 TUI 历史反复送回模型。
 
+同步 `run`/`reply` 及其他原生 CLI 捕获默认受 `-ProcessTimeoutSeconds 1800` 约束（范围 15-3600 秒）。冒烟测试应显式使用较短但足以完成一次模型响应的超时；超时后 wrapper 只对自己启动的进程树请求终止，不扫描或终止其他 Claude/Node 进程。已经脱离该进程树的后代可能存活；重试前检查进程与 provider 状态。若已经返回可恢复 session，应优先续接该 session，不能重开会话重复读取。
+
 `logs` 只保证用于 supervisor 仍在运行的员工。本机 Agent View daemon 是按需进程，全部员工停止后会退出；此时通过 `attach` 或 `respawn` 恢复原对话，而不是强行常驻 daemon。
 
 ## 后台权限请求处理
@@ -212,7 +219,7 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action logs -I
 
 - 需要 PowerShell 7、Claude Code `2.1.200` 或更高版本。可直接使用 PATH 中的 `claude`，也可指定已审计的本机 wrapper。
 - 可通过 `-ClaudeExecutable` / `-ExpectedClaudeSha256`、环境变量 `CLAUDE_WORKFORCE_EXECUTABLE` / `CLAUDE_WORKFORCE_SHA256`，或私有文件 `~/.codex/claude-workforce.local.psd1` 配置可执行文件和可选固定哈希。优先级为命令行、私有文件、环境变量、PATH；公开仓库不得提交该私有文件。
-- 私有配置只接受 `ClaudeExecutable`、`ExpectedClaudeSha256`、`AllowBroadWebFetch`、`EnableToolSearch` 四个键。`EnableToolSearch` 必须先通过当前 provider/proxy 的真实 MCP 调用探针。wrapper 更新后应先重新审计，再更新固定哈希并重跑 capability、权限探针和冒烟测试。
+- 私有配置的有效键是 `ClaudeExecutable`、`ExpectedClaudeSha256`、`EnableToolSearch`；旧 `AllowBroadWebFetch` 仅为兼容而接受，不授予权限。`EnableToolSearch` 必须先通过当前 provider/proxy 的真实 MCP 调用探针。wrapper 更新后应先重新审计，再更新固定哈希并重跑 capability、权限探针和冒烟测试。
 - `CODEX_THREAD_ID` 缺失时员工归入 `cx-manual`；需要严格跨任务隔离时不要在缺失该变量的环境启动员工。
 
 ## 继续同一对话
@@ -270,13 +277,19 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action remove 
 
 不要自动清理已完成员工；保留它们才能隔很久后找回继续聊。
 
+## 会话版本与 Git 来源
+
+- 每个新持久员工名称都带 `w<profile-version>-p<fingerprint>`。指纹由启动时仓库根、原始 origin、branch 和 commit 计算；本地输出向 Codex 返回脱敏来源字段，发给 CC 的任务合同只含来源类型和不可逆指纹，不发送 remote 或 branch。
+- `reply` 会在恢复前重算来源。没有标记的旧会话默认停止，核对日志、cwd、fork、branch 和配置后才可显式加 `-AllowLegacySession`。来源指纹改变时默认停止，确认 checkout、commit 或 fork 变化是预期行为后才可加 `-AllowProvenanceDrift`。
+- 已运行进程不会因安装新 skill/profile 而自动升级。权限模型或 profile 版本变化时新开员工；不要把旧 fork、旧 branch 或旧 profile 的结论当成当前代码状态。
+
 ## 安全边界
 
 - Agent View 是 Research Preview，但由官方 supervisor 落盘 roster、状态和 transcript，优先于依赖一次性 `claude -p` 的第三方插件。
-- **原生 Windows 没有 Claude Code 的完整 OS 沙箱或进程级 shell deny**。权限 deny 规则和 permission mode 提供工具层面的约束，但不在 OS 层面阻止文件读取或进程执行。Git worktree 只隔离代码改动，不隔离文件系统访问。不应声称 Windows 上存在 OS 沙箱或 shell deny 的绝对安全保证。
+- **原生 Windows 没有 Claude Code 的完整 OS 沙箱或进程级 shell deny**。session 权限规则、MCP 审批和 permission mode 提供工具层面的约束，但不在 OS 层面阻止文件读取或进程执行。Git worktree 只隔离代码改动，不隔离文件系统访问。不应声称 Windows 上存在 OS 沙箱或 shell deny 的绝对安全保证。
 - `write` 模式使用 `default` 权限模式而非 `acceptEdits`：每次编辑操作都需请求授权。`--settings` 中的 `ask` 规则覆盖用户/项目全局 `allow`，确保未明确批准的动作产生请求。
-- `plan` 仍允许读取、只读命令和预授权的公开知识检索，不是零工具沙箱。依赖默认 deny `Agent`、ask/deny 规则覆盖敏感工具、以及 `-NoTools` 做真正的无工具测试。
+- `plan` 仍允许读取、规划和预授权的公开知识检索，不是零工具沙箱。敏感路径、编辑、通用 Bash、WebFetch 和 Agent 由 ask 规则交给主管；`-NoTools` 才用于真正的无工具测试。
 - 不自动 commit、push、发布、部署或开 PR。即使员工声称需要，也回到 Codex 主对话请求授权。
 - 不直接读取 `~/.claude/daemon`、job state 或 transcript 正文；使用 `list` 和 `logs` 命令获取受支持的视图。
 - CC 或 wrapper 更新后重新运行 `capabilities`，再用 `-NoTools -Effort low` 进行低成本启动、列表、日志和停止冒烟测试。
-- `-AllowNestedAgents` 将 Agent 从 deny 移到 ask（允许但每次请求），可能导致 token 消耗失控；仅在用户明确批准额外并行成本后使用。
+- `-AllowNestedAgents` 将 Agent 从 ask 移到当前会话 allow，可能显著增加 token；只有可独立并行且预期净节省时使用。

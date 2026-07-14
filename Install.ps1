@@ -21,10 +21,21 @@ if ($destinationFull -in $protectedRoots -or [IO.Path]::GetFileName($destination
     throw 'Destination must be a dedicated directory named claude-workforce, not a filesystem, HOME, .codex, or skills root.'
 }
 $Destination = $destinationFull
+$destinationExists = Test-Path -LiteralPath $Destination
+if ($destinationExists) {
+    $destinationItem = Get-Item -LiteralPath $Destination -Force
+    if (-not $destinationItem.PSIsContainer) {
+        throw 'Existing destination must be a directory.'
+    }
+    if (($destinationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Existing destination must not be a symbolic link, junction, or other reparse point.'
+    }
+}
 $required = @(
     ([IO.Path]::Combine($source, 'SKILL.md')),
     ([IO.Path]::Combine($source, 'agents', 'openai.yaml')),
-    ([IO.Path]::Combine($source, 'scripts', 'claude-workforce.ps1'))
+    ([IO.Path]::Combine($source, 'scripts', 'claude-workforce.ps1')),
+    ([IO.Path]::Combine($source, 'scripts', 'new-workforce-session-profile.ps1'))
 )
 foreach ($path in $required) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -34,12 +45,12 @@ foreach ($path in $required) {
 
 $destinationParent = Split-Path -Parent $Destination
 $backup = $null
-if (Test-Path -LiteralPath $Destination) {
+if ($destinationExists) {
     if (-not $Force) {
         throw "Destination already exists: $Destination. Re-run with -Force to back it up and replace it."
     }
     $backupRoot = [IO.Path]::Combine($HOME, '.codex', 'backups')
-    $backup = Join-Path $backupRoot "claude-workforce-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    $backup = Join-Path $backupRoot "claude-workforce-$(Get-Date -Format 'yyyyMMdd-HHmmss-fff')"
     if ($PSCmdlet.ShouldProcess($Destination, "Back up to $backup")) {
         New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
         Copy-Item -LiteralPath $Destination -Destination $backup -Recurse -Force

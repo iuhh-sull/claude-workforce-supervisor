@@ -14,16 +14,17 @@ pwsh -NoProfile -File Install.ps1
 
 First install doesn't need `-Force`. Add `-Force` only to overwrite an existing installation; the script backs up the old directory first.
 
-After install you can create a private config at `~/.codex/claude-workforce.local.psd1`. It accepts exactly four keys:
+After install you can create a private config at `~/.codex/claude-workforce.local.psd1`. The recommended active keys are:
 
 ```powershell
 @{
     ClaudeExecutable   = "C:\path\to\claude.exe"
     ExpectedClaudeSha256 = "<64-char hex hash>"
-    AllowBroadWebFetch = $true
     EnableToolSearch = $true
 }
 ```
+
+The legacy `AllowBroadWebFetch` key is still parsed so old private files do not break, but it grants no permission and should be removed when convenient.
 
 Don't commit this file to a public repository. Precedence: CLI parameters > private file > environment variables > PATH.
 
@@ -87,7 +88,7 @@ With a custom DeepSeek endpoint, the Claude Agent SDK may estimate `total_cost_u
 
 `-ProviderBudgetCny` is a post-run soft threshold for accounting and alerts. `-MaxBudgetUsd` remains available as an SDK-internal hard stop, but it does not represent a DeepSeek CNY budget. Official background `--bg` supports neither limit, so `start` does not claim a hard cap. `run` and `reply` require finite `-MaxTurns` plus at least one of `-ProviderBudgetCny` or `-MaxBudgetUsd`. Allow at least four turns for typical public research so discovery, tool execution, and the final response can complete.
 
-DeepSeek's low provider price lowers the practical delegation threshold: consider CC around 5k tokens, three or more files, two or more independent searches, or a single huge/minified/generated file. Codex should usually handle ordinary changes within two files and roughly 3k tokens to avoid dispatch and review overhead.
+When DeepSeek is materially cheaper than scarce Codex quota, delegate by default whenever the task has a clear contract, can return a compressed result, and does not require sensitive approval; do not impose a mechanical minimum file or token count. Around 3k tokens, two or more files, two independent searches, or a single huge/minified/generated file are clear delegation cases. Codex should usually handle only a single very short file under roughly 1k tokens when the change is one-step and immediately verifiable. Stop on scope drift, repeated reads, lack of progress, rework, or real provider CNY cost—not merely because the DS token count looks large.
 
 Do not discard paid work after a budget stop. Preserve the session and usage, diagnose whether context, cache, tool turns, or output caused the overrun, then give the same session a small evidence-based finalization budget with instructions to stop using tools and compress the existing result. Do not start a fresh reread.
 
@@ -97,23 +98,29 @@ Use flash + low/medium for retrieval, extraction, formatting, smoke tests, and m
 
 Route by error cost and expected rework, not only by input size. Higher effort spends more thinking tokens, so routine follow-up work should not inherit high/max from an earlier phase. Typical delivery estimates are 20–60 seconds for flash/low, 1–3 minutes for flash/medium, 3–8 minutes for pro/high, and 5–15 minutes for pro/max or multi-tool work. Check status near the expected milestone rather than polling continuously, except for permission requests or near-terminal work.
 
+After a failed CC call, review model, effort, context scope, tool turns, budget, and final-output headroom separately. Do not default to Pro/max when a mechanical read exceeded its turn envelope; slice or compress the input and resume the same session first. `MaxTurns` should cover the expected tool calls plus at least two finalization turns; multi-file evidence gathering commonly starts at 8–20 turns, with 1.5–2× that allowance during testing. For explicitly approved, non-sensitive summaries, usage data, error-log excerpts, and project files, context-mode may be temporarily allowed by exact tool name and path, but that grant does not extend to credentials, drive-wide scans, arbitrary commands, writes, or exfiltration. Synchronous native CLI capture accepts `-ProcessTimeoutSeconds` from 15 to 3600 seconds (default 1800) and requests termination of only the process tree it started. A detached descendant may survive, so check process and provider state before retrying.
+
 ## Permissions
 
-Public search (WebSearch, Exa search, Tavily search/research) is allowed by default. No prompt.
+`new-workforce-session-profile.ps1` builds temporary, session-scoped settings shared by the MCP and Agent View paths. It never writes to `~/.claude/settings.json`, so a normal interactive `claude` session keeps the user's own model and permission defaults.
 
-URL fetching (WebFetch, Exa fetch, Tavily extract/crawl/map, context-mode fetch) prompts by default. Set `AllowBroadWebFetch = $true` in the private config to skip the prompt if you trust your environment.
+Read, Glob, Grep, WebSearch, and Plan are pre-authorized. Sensitive paths such as credential stores, private keys, `.env`, and user auth/settings files are covered by higher-priority ask rules. A worker may read user configuration only when the current task authorizes it, and must not echo or transmit secret values.
 
-Bash, Edit, Write, NotebookEdit always prompt.
+Shell commands, Edit, Write, NotebookEdit, each WebFetch target, Agent, and side-effecting MCP tools are surfaced through the permission proxy. Codex may approve a public URL or a clearly read-only shell/Git inspection directly; writes, outbound local data, authentication, installation, publishing, and deployment require an input-specific decision.
 
-Credential stores (.env, .ssh, .aws, auth files, private keys, .npmrc, .pypirc, .netrc, .docker/config.json, gh config, `*credentials.json`, `*secrets.yaml`, `*.pem`, `*.key`) are blocked from read, edit, and write.
+MCP calls leave top-level `allowedTools` and `disallowedTools` empty. The maintained `claude-code-mcp` permission proxy uses `canUseTool`, `claude_code_check`, and `respond_permission` to present each unresolved action to the supervisor. Approvals are for the current request and are not written back as persistent Claude settings.
 
-Global config: workers can read but not modify. If they encounter secrets, they must not echo or transmit them.
+Agent is ask-by-default. `-AllowNestedAgents` promotes Agent to allow only inside the delegated session, so enable it when parallel work has a clear payoff and bounded scope.
 
-Nested agents are denied by default. Pass `-AllowNestedAgents` to change to ask-per-use. Don't enable unless you need the parallelism.
+The legacy `AllowBroadWebFetch` input is still accepted for compatibility, but it no longer bypasses per-target review. Claude Code's `auto` mode is not used here: the official mode requires the Anthropic API and supported Claude models, while this workforce targets a custom DeepSeek provider.
+
+Treat `maxTurns` as a requested boundary that must be checked against the returned usage and status. This SDK/provider combination has exceeded the requested value in testing, so scope drift, repeated reads, progress, and actual provider cost remain the practical stop signals.
+
+Every new persistent worker name includes a workforce-profile version and a fingerprint derived from its launch repository root, origin, branch, and commit. `start` returns the locally sanitized source fields to Codex, but sends only the source kind and irreversible fingerprint in the CC prompt. `reply` recomputes the fingerprint and stops on an old unversioned worker or a changed fork/branch/commit. After manual review, `-AllowLegacySession` can resume a pre-version worker and `-AllowProvenanceDrift` can accept an intentional Git change. Existing processes do not inherit a newly installed profile retroactively; start a new worker when the permission model changes.
 
 ## Windows note
 
-Native Windows doesn't provide a full OS sandbox for Claude Code. Permission deny rules enforce at the tool level, not at the OS level. Don't rely on this for sandboxing.
+Native Windows doesn't provide a full OS sandbox for Claude Code. Session rules and MCP approval act at the tool level, not at the OS level. Don't rely on this for sandboxing.
 
 ## Remove a worker
 
@@ -132,6 +139,7 @@ claude-workforce/
   agents/openai.yaml       # OpenAI-compatible agent definition
   scripts/
     claude-workforce.ps1   # Core wrapper
+    new-workforce-session-profile.ps1 # Session-only MCP/worker settings
 Install.ps1                # Install script
 tests/
   Test-ClaudeWorkforce.ps1 # Parse check + runtime permission probe

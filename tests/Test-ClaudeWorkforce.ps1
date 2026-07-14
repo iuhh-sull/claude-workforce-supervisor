@@ -7,8 +7,9 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 }
 
 $scriptPath = Join-Path $PSScriptRoot '..\claude-workforce\scripts\claude-workforce.ps1'
+$profilePath = Join-Path $PSScriptRoot '..\claude-workforce\scripts\new-workforce-session-profile.ps1'
 $installPath = Join-Path $PSScriptRoot '..\Install.ps1'
-foreach ($path in @($scriptPath, $installPath)) {
+foreach ($path in @($scriptPath, $profilePath, $installPath)) {
     $tokens = $null
     $errors = $null
     [void][Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
@@ -22,6 +23,7 @@ $forbidden = @(
     'bypassPermissions',
     'acceptEdits',
     'dontAsk',
+    'LaunchProvenance: remote=',
     ('C:' + [IO.Path]::DirectorySeparatorChar + 'Users' + [IO.Path]::DirectorySeparatorChar),
     ('D:' + [IO.Path]::DirectorySeparatorChar + 'Git' + [IO.Path]::DirectorySeparatorChar)
 )
@@ -39,6 +41,7 @@ $requiredMarkers = @(
     'ProviderBudgetCny',
     'IncludeSdkCostEstimate',
     'MaxMcpOutputTokens',
+    'ProcessTimeoutSeconds',
     'EnableToolSearch',
     '--max-turns',
     '--max-budget-usd',
@@ -68,6 +71,12 @@ $result = [ordered]@{
     provider_cost_estimate = $false
     provider_soft_budget = $false
     reply_model_guard = $false
+    reply_success_output = $false
+    start_success_output = $false
+    list_success_output = $false
+    mcp_profile = $false
+    local_remote_redacted = $false
+    credential_remote_redacted = $false
     runtime = -not $SkipRuntime
 }
 
@@ -88,6 +97,38 @@ if (-not $boundaryRejected) {
 }
 $result.installer_boundary = $true
 
+$mcpProfile = & $profilePath -Output mcp -ContextProfile project | ConvertFrom-Json -ErrorAction Stop
+if ($mcpProfile.purpose -ne 'codex-claude-workforce-session-only' -or $mcpProfile.schema_version -ne 1) {
+    throw 'MCP workforce profile identity is invalid.'
+}
+if (@($mcpProfile.advanced.settingSources) -join ',' -ne 'user,project' -or -not $mcpProfile.advanced.persistSession -or -not $mcpProfile.advanced.strictMcpConfig) {
+    throw 'MCP project profile isolation fields are invalid.'
+}
+if (@($mcpProfile.allowedTools).Count -ne 0 -or @($mcpProfile.disallowedTools).Count -ne 0 -or $mcpProfile.strictAllowedTools) {
+    throw 'MCP profile must leave broad grants and hard denials empty so claude-code-mcp canUseTool can surface per-request approval.'
+}
+foreach ($tool in @('Read', 'Glob', 'Grep', 'WebSearch', 'Plan', 'EnterPlanMode', 'ExitPlanMode')) {
+    if ($tool -notin @($mcpProfile.settings.permissions.allow)) {
+        throw "MCP profile is missing expected low-risk allow rule: $tool"
+    }
+}
+foreach ($tool in @('Bash', 'Edit', 'Write', 'NotebookEdit', 'WebFetch', 'Agent')) {
+    if ($tool -notin @($mcpProfile.settings.permissions.ask)) {
+        throw "MCP profile is missing expected review rule: $tool"
+    }
+}
+foreach ($rule in @('Read(**/.env)', 'Read(~/.codex/auth.json)', 'Read(~/.claude/settings.json)')) {
+    if ($rule -notin @($mcpProfile.settings.permissions.ask)) {
+        throw "MCP profile is missing sensitive-read review rule: $rule"
+    }
+}
+$nestedProfile = & $profilePath -Output mcp -ContextProfile project -AllowNestedAgents | ConvertFrom-Json -ErrorAction Stop
+if ('Agent' -notin @($nestedProfile.settings.permissions.allow) -or 'Agent' -in @($nestedProfile.settings.permissions.ask) -or
+    'Task' -notin @($nestedProfile.settings.permissions.allow) -or 'Task' -in @($nestedProfile.settings.permissions.ask)) {
+    throw 'Explicit nested-agent authorization was not scoped into the MCP session profile.'
+}
+$result.mcp_profile = $true
+
 if (-not $SkipRuntime) {
     $fakeClaude = Join-Path ([IO.Path]::GetTempPath()) "claude-workforce-fake-$([guid]::NewGuid().ToString('N')).ps1"
     $fakeSource = @'
@@ -102,6 +143,24 @@ if ($Remaining.Count -ge 2 -and $Remaining[0] -eq 'agents' -and $Remaining[1] -e
 }
 if ('--help' -in $Remaining) {
     '--output-format --max-budget-usd'
+    exit 0
+}
+if ($Remaining.Count -ge 2 -and $Remaining[0] -eq 'agents' -and $Remaining[1] -eq '--json') {
+    [ordered]@{
+        id = 'worker-reply'
+        name = 'cx-manual-reply-test'
+        sessionId = '44444444-4444-4444-8444-444444444444'
+        cwd = (Get-Location).Path
+        status = 'completed'
+    } | ConvertTo-Json -AsArray
+    exit 0
+}
+if ('--bg' -in $Remaining) {
+    'STARTED'
+    exit 0
+}
+if ('--resume' -in $Remaining) {
+    '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"44444444-4444-4444-8444-444444444444","total_cost_usd":0.25,"usage":{"input_tokens":100,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40},"result":"REPLY_OK"}'
     exit 0
 }
 if (($Remaining -join ' ') -like '*null usage probe*') {
@@ -125,7 +184,7 @@ if (($Remaining -join ' ') -like '*provider soft budget probe*') {
             cache_read_input_tokens = 30
             output_tokens = 40
         }
-        result = "SDK_BUDGET_PRESENT=$hasSdkBudget;PROMPT_AFTER_SEPARATOR=$promptFollowsSeparator"
+        result = "SDK_BUDGET_PRESENT=$hasSdkBudget;PROMPT_AFTER_SEPARATOR=$promptFollowsSeparator;TOOL_SEARCH=$env:ENABLE_TOOL_SEARCH"
     } | ConvertTo-Json -Compress
     exit 0
 }
@@ -133,6 +192,7 @@ if (($Remaining -join ' ') -like '*provider soft budget probe*') {
 exit 1
 '@
     [IO.File]::WriteAllText($fakeClaude, $fakeSource, [Text.UTF8Encoding]::new($false))
+    $localOriginRepo = $null
     try {
         $fakeHash = (Get-FileHash -LiteralPath $fakeClaude -Algorithm SHA256).Hash
         $backgroundBudgetRejected = $false
@@ -153,6 +213,41 @@ exit 1
         }
         $result.background_budget_guard = $true
 
+        $startResult = (& $scriptPath -Action start -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'start success probe' -NoTools | ConvertFrom-Json)
+        if ($startResult.launch -ne 'STARTED' -or $startResult.mode -ne 'inspect' -or -not $startResult.no_tools) {
+            throw 'Successful background start output was not returned.'
+        }
+        if ($startResult.workforce_profile_version -ne 1 -or $startResult.worker_name -notmatch '-w1-p[0-9a-f]{10}$' -or [string]::IsNullOrWhiteSpace([string]$startResult.launch_provenance.fingerprint)) {
+            throw 'Background start did not record workforce profile and launch provenance.'
+        }
+        $result.start_success_output = $true
+
+        $git = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $localOriginRepo = Join-Path ([IO.Path]::GetTempPath()) "claude-workforce-origin-$([guid]::NewGuid().ToString('N'))"
+        New-Item -ItemType Directory -Path $localOriginRepo -Force | Out-Null
+        & $git.Source -C $localOriginRepo init --quiet
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to create local-origin provenance test repository.' }
+        & $git.Source -C $localOriginRepo remote add origin 'C:\private\secret-origin\repo.git'
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to add local-origin provenance test remote.' }
+        $localOriginStart = (& $scriptPath -Action start -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd $localOriginRepo -Prompt 'local origin redaction probe' -NoTools | ConvertFrom-Json)
+        if ($localOriginStart.launch_provenance.remote -ne '[local-or-private-remote]') {
+            throw 'Windows local Git origin leaked through launch provenance.'
+        }
+        $result.local_remote_redacted = $true
+        & $git.Source -C $localOriginRepo remote set-url origin 'https://oauth2:example-secret@github.com/example/repo.git'
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to replace provenance test remote.' }
+        $credentialOriginStart = (& $scriptPath -Action start -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd $localOriginRepo -Prompt 'credential origin redaction probe' -NoTools | ConvertFrom-Json)
+        if ($credentialOriginStart.launch_provenance.remote -ne 'github.com/example/repo.git' -or [string]$credentialOriginStart.launch_provenance.remote -match 'oauth2|example-secret') {
+            throw 'Credential-bearing Git origin was not redacted from launch provenance.'
+        }
+        $result.credential_remote_redacted = $true
+
+        $listResult = (& $scriptPath -Action list -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -All -AllThreads | ConvertFrom-Json)
+        if ($listResult.count -ne 1 -or $listResult.workers[0].id -ne 'worker-reply') {
+            throw 'Successful worker list output was not returned.'
+        }
+        $result.list_success_output = $true
+
         $replyModelRejected = $false
         try {
             & $scriptPath -Action reply -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'worker-model-guard' -Prompt 'guard probe' -MaxTurns 1 -ProviderBudgetCny ([decimal]'0.01') | Out-Null
@@ -169,6 +264,26 @@ exit 1
             throw 'Reply silently accepted the default model instead of requiring deliberate routing.'
         }
         $result.reply_model_guard = $true
+
+        $legacyRejected = $false
+        try {
+            & $scriptPath -Action reply -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'worker-reply' -AllThreads -Prompt 'legacy provenance probe' -NoTools -MaxTurns 1 -MaxBudgetUsd 1 -Model 'deepseek-v4-flash[1m]' | Out-Null
+        }
+        catch {
+            $legacyRejected = $_.Exception.Message -match 'predates workforce provenance tracking'
+        }
+        if (-not $legacyRejected) {
+            throw 'Legacy worker resumed without an explicit provenance override.'
+        }
+
+        $replyResult = (& $scriptPath -Action reply -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'worker-reply' -AllThreads -Prompt 'reply success probe' -NoTools -MaxTurns 1 -MaxBudgetUsd 1 -IncludeSdkCostEstimate -Model 'deepseek-v4-flash[1m]' -AllowLegacySession | ConvertFrom-Json)
+        if ($replyResult.action -ne 'reply' -or $replyResult.result -ne 'REPLY_OK' -or $replyResult.session_id -ne '44444444-4444-4444-8444-444444444444' -or $replyResult.session_provenance_status -ne 'legacy-override') {
+            throw 'Successful reply output was not returned as one structured object.'
+        }
+        if ($replyResult.total_cost_usd -ne 0.25 -or $replyResult.sdk_total_cost_usd -ne 0.25 -or $replyResult.provider_cost_estimate_cny -ne [decimal]'0.000201') {
+            throw 'Successful reply diagnostic and provider-cost fields were not preserved.'
+        }
+        $result.reply_success_output = $true
 
         $errorResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'error recovery probe' -NoTools -MaxTurns 2 -MaxBudgetUsd 1 -IncludeSdkCostEstimate | ConvertFrom-Json)
         if ($errorResult.process_exit_code -ne 1 -or $errorResult.result_subtype -ne 'error_max_turns' -or -not $errorResult.is_error) {
@@ -192,8 +307,15 @@ exit 1
         $result.provider_cost_estimate = $true
         $result.nonzero_usage_recovery = $true
 
-        $providerBudgetResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'provider soft budget probe' -NoTools -MaxTurns 1 -ProviderBudgetCny ([decimal]'0.0001') | ConvertFrom-Json)
-        if ($providerBudgetResult.result -ne 'SDK_BUDGET_PRESENT=False;PROMPT_AFTER_SEPARATOR=True' -or $providerBudgetResult.sdk_budget_enabled) {
+        $previousToolSearch = $env:ENABLE_TOOL_SEARCH
+        $env:ENABLE_TOOL_SEARCH = 'true'
+        try {
+            $providerBudgetResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'provider soft budget probe' -NoTools -MaxTurns 1 -ProviderBudgetCny ([decimal]'0.0001') | ConvertFrom-Json)
+        }
+        finally {
+            $env:ENABLE_TOOL_SEARCH = $previousToolSearch
+        }
+        if ($providerBudgetResult.result -ne 'SDK_BUDGET_PRESENT=False;PROMPT_AFTER_SEPARATOR=True;TOOL_SEARCH=' -or $providerBudgetResult.sdk_budget_enabled) {
             throw 'Provider-only budget enabled the SDK budget or the current prompt was not isolated after the option terminator.'
         }
         if ($null -ne $providerBudgetResult.PSObject.Properties['total_cost_usd'] -or $null -ne $providerBudgetResult.PSObject.Properties['sdk_total_cost_usd'] -or $null -ne $providerBudgetResult.PSObject.Properties['sdk_cost_note']) {
@@ -215,6 +337,9 @@ exit 1
     }
     finally {
         Remove-Item -LiteralPath $fakeClaude -Force -ErrorAction SilentlyContinue
+        if ($localOriginRepo -and (Test-Path -LiteralPath $localOriginRepo -PathType Container)) {
+            Remove-Item -LiteralPath $localOriginRepo -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
     $capabilities = (& $scriptPath -Action capabilities | ConvertFrom-Json)
@@ -239,7 +364,7 @@ exit 1
     if (-not $capabilities.sdk_cost_estimate_optional -or $capabilities.sdk_cost_estimate_included_by_default) {
         throw 'SDK cost estimate visibility defaults are unsafe or undocumented.'
     }
-    if ($capabilities.default_context_profile -ne 'auto' -or $capabilities.default_mcp_output_tokens -ne 10000) {
+    if ($capabilities.default_context_profile -ne 'auto' -or $capabilities.default_mcp_output_tokens -ne 10000 -or $capabilities.process_timeout_seconds -ne 1800) {
         throw 'Cost-control defaults drifted from the documented profile.'
     }
     foreach ($argument in @('--no-chrome', '--safe-mode', '--strict-mcp-config', '--tools', '--disable-slash-commands')) {
@@ -247,31 +372,28 @@ exit 1
             throw "No-tools isolation capability is missing argument: $argument"
         }
     }
-    $expectedSearchAllow = @(
-        'WebSearch',
-        'mcp__plugin_exa_exa__web_search_exa',
-        'mcp__tavily__tavily_research',
-        'mcp__tavily__tavily_search'
-    )
-    foreach ($tool in $expectedSearchAllow) {
+    foreach ($tool in @('Read', 'Glob', 'Grep', 'WebSearch', 'Plan', 'EnterPlanMode', 'ExitPlanMode')) {
         if ($tool -notin @($capabilities.effective_allow_tools)) {
-            throw "Expected public search tool is not allowed: $tool"
+            throw "Expected planning tool is not allowed: $tool"
         }
     }
-    foreach ($tool in @('Bash', 'Edit', 'Write', 'NotebookEdit')) {
+    foreach ($tool in @('Bash', 'Edit', 'Write', 'NotebookEdit', 'WebFetch', 'Agent')) {
         if ($tool -notin @($capabilities.effective_ask_tools)) {
-            throw "Expected side-effecting tool is not in ask: $tool"
+            throw "Expected fail-safe tool is not in ask: $tool"
         }
     }
-    if ('Agent' -notin @($capabilities.effective_deny_tools)) {
-        throw 'Agent must be denied unless explicitly enabled for a task.'
+    if (@($capabilities.effective_deny_tools).Count -ne 0) {
+        throw 'Normal workforce permissions should ask rather than permanently deny task-relevant tools.'
     }
-    foreach ($rule in @('Read(./.env)', 'Edit(./.env)', 'Write(./.env)', 'Read(~/.codex/auth.json)', 'Edit(~/.codex/auth.json)', 'Write(~/.codex/auth.json)')) {
-        if ($rule -notin @($capabilities.effective_deny_tools)) {
-            throw "Credential protection rule is missing: $rule"
+    foreach ($rule in @('Read(**/.env)', 'Read(~/.codex/auth.json)', 'Read(~/.claude/settings.json)')) {
+        if ($rule -notin @($capabilities.effective_ask_tools)) {
+            throw "Credential review rule is missing: $rule"
         }
     }
     $result.executable_hash_pinned = [bool]$capabilities.executable_hash_pinned
+    if ($capabilities.broad_web_fetch_allowed -or -not $capabilities.public_web_fetch_reviewed_by_supervisor) {
+        throw 'Broad fetch compatibility flag must not bypass per-target supervisor review.'
+    }
     $result.broad_web_fetch_allowed = [bool]$capabilities.broad_web_fetch_allowed
 }
 
