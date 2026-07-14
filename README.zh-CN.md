@@ -81,7 +81,11 @@ status、log、reply、stop、remove 的完整用法见 [SKILL.md](./claude-work
 
 完整工具环境可能在第一句话之前就注入数万 tokens。只有任务确实需要 MCP 时才用 `full`。自定义 `ANTHROPIC_BASE_URL` 下，Claude Code 默认可能不启用 Tool Search；`EnableToolSearch = $true` 必须经过真实 MCP 调用验证后再设。wrapper 还把单个 MCP 输出默认限制在 10,000 tokens。
 
+评估是否省额度时，不能把 Codex/GPT 和 DeepSeek/CC 的 token 或费用相加。先算 CC 避免了多少 Codex 上下文，再扣掉派单、轮询、定点复核和返工；DeepSeek 费用单独报告。CC 返回后，Codex 默认只核对它标出的路径、行号、URL、diff 和失败点，不再通读同一批材料。若最终仍需完整重读，这次调用属于交叉审查，不算节省 Codex 额度。
+
 官方后台 `--bg` 不支持 `--max-budget-usd`，所以 `start` 没有伪造硬预算。要限制费用就用 `run` 或支持预算/权限回复的 MCP。`reply` 也必须显式给 `-MaxTurns` 和 `-MaxBudgetUsd`。一次公开搜索通常至少留 4 回合，覆盖工具发现、工具调用和最终回答。
+
+预算耗尽后不要丢弃已经付费的工作：保留 session 和 usage，分析是上下文、缓存、工具回合还是输出导致超支，再给同一 session 一次有依据的小额收尾预算，让它停止新工具并压缩交付；不要另开会话重读。
 
 ## 模型选择
 

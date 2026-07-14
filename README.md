@@ -81,7 +81,11 @@ For status, log, reply, stop, and remove commands, see [SKILL.md](./claude-workf
 
 A full tool environment can inject tens of thousands of tokens before the first task sentence. Use `full` only when the task actually needs MCP. With a custom `ANTHROPIC_BASE_URL`, Claude Code may not enable Tool Search automatically; set `EnableToolSearch = $true` only after a real MCP call succeeds. The wrapper also caps a single MCP result at 10,000 tokens by default.
 
+Do not add Codex/GPT and DeepSeek/CC tokens or prices together when judging quota savings. First measure the Codex context avoided by delegation, then subtract Codex dispatch, polling, targeted review, and rework; report DeepSeek spend separately. After CC returns, Codex should verify only the cited paths, lines, URLs, diff, and failures instead of rereading the same corpus. If a full reread is still required, treat the call as a second-opinion review, not a Codex-quota saving.
+
 Official background `--bg` does not support `--max-budget-usd`, so `start` does not pretend to enforce a hard cap. Use `run` or an MCP client with budget and permission handling when a hard limit matters. `reply` also requires explicit `-MaxTurns` and `-MaxBudgetUsd`. Allow at least four turns for a typical public search so tool discovery, tool execution, and the final answer can all complete.
+
+Do not discard paid work after a budget stop. Preserve the session and usage, diagnose whether context, cache, tool turns, or output caused the overrun, then give the same session a small evidence-based finalization budget with instructions to stop using tools and compress the existing result. Do not start a fresh reread.
 
 ## Model routing
 

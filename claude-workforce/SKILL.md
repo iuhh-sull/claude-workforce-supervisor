@@ -61,9 +61,9 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action capabil
 
 **MCP 继承：**
 
-- 正常模式**不使用 `--strict-mcp-config`**，员工继承 Codex 环境的 MCP 配置。
-- 公开搜索 MCP 使用精确工具名默认放行；任意 URL 抓取、浏览器点击/填表/上传、认证会话、远端写入以及其他可能外发本地数据或产生副作用的 MCP 不在默认 allow 中，仍逐项响应权限请求。
-- 仅 `-NoTools` 使用 `--strict-mcp-config` 阻断所有 MCP 继承。
+- `minimal`、`user`、`project` 都使用 `--strict-mcp-config`，默认不继承 MCP；`full` 才继承当前配置的 MCP。
+- `full` 中的公开搜索 MCP 使用精确工具名默认放行；任意 URL 抓取、浏览器点击/填表/上传、认证会话、远端写入以及其他可能外发本地数据或产生副作用的 MCP 不在默认 allow 中，仍逐项响应权限请求。
+- `-NoTools` 额外移除内置工具和 slash commands，并强制 `--strict-mcp-config`；即使显式选择 `full` 也不会启用 MCP 或 Tool Search。
 
 ## 派单
 
@@ -71,9 +71,14 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action capabil
 
 调用前先估算净收益，比较 Codex 直接完成与“CC 执行 + MCP/worker 轮询 + Codex 复核 + 可能返工”的总成本。满足下列任一条件且预期返工较低时，才优先调用 CC：
 
+跨模型评估必须分账：节省 Codex/GPT 配额是主指标，DeepSeek/CC tokens 和费用是独立副指标，不能直接相加。净节省只计算“CC 避免的 Codex 输入、输出和工具回灌”减去“Codex 派单、轮询、定点复核和返工”；若 Codex 最后仍通读同一批大材料，该调用只能记为质量交叉审查，不能记为节省额度。
+
 - 需要处理约 20k tokens 以上原始材料，CC 可以只返回 2k-4k tokens 的证据摘要。
 - 涉及十个以上文件的检索、分类、机械审查或一致性修改。
 - 需要生成长文初稿、跨来源摘要、批量文本、重复性代码或测试样板，并能让 CC 直接落盘后只回报 diff 和验证结果。
+- 工作会产生大量搜索、日志、测试或文件读取输出，但 Codex 主对话只需要带路径/行号/URL的结构化摘要。
+- 需要隔离主对话假设的独立代码审查、提交前验证或第二意见，并能用测试或定点证据验收。
+- 多个子任务彼此独立、不会同时修改同一文件，也不需要代理之间持续协调。
 - 已有持久会话包含可复用上下文，续接的增量成本明显低于 Codex 重新读取。
 
 以下任务默认由 Codex 直接处理，不调用 CC：
@@ -81,9 +86,15 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action capabil
 - 五个以内文件、约 10k tokens 以内相关上下文、短文精修或几处明确的小补丁。
 - 全局配置、权限策略、密钥边界、发布、提交、推送、部署和其他高风险或外部副作用操作。
 - CC 的产物仍需 Codex 逐行重做、无法压缩返回，或预计轮询与复核成本不低于直接完成。
+- 需要频繁来回澄清、多个阶段共享大量上下文、步骤强顺序依赖，或多个员工会同时修改同一文件。
+- 子任务必须互相通信、协商或共享不断变化的状态；普通 subagent/worker 只适合清晰 handoff，不适合隐式协同。
 - 任务边界尚未明确，或关键选择会实质改变结果。先由 Codex 澄清或收敛范围。
 
 这些数量是默认止损线，不是机械门槛。用户明确要求调用 CC 时可以调用，但仍须使用最小范围、有限预算和完整提示词合同；若判断明显不省成本，应先向用户说明。
+
+CC 返回后，Codex 默认只读它给出的证据索引、命中行、最终 diff、测试失败点和不确定项，不再通读原始材料。只有安全/权限/密钥/发布、证据冲突、测试失败或定点抽样发现错误时，才扩大到相关局部；必须记录扩大读取的触发原因。高风险验收需要检查原始 diff，不等于重读 CC 已扫描的全部仓库或资料。
+
+上述边界参考 Anthropic 的 [subagent 使用指南](https://claude.com/blog/subagents-in-claude-code) 与 [官方 subagent 文档](https://code.claude.com/docs/en/sub-agents)。社区问题只作为风险信号：官方仓库已有[跨会话重复工作报告](https://github.com/anthropics/claude-code/issues/39961)和[未读取源文件便生成结论的报告](https://github.com/anthropics/claude-code/issues/44317)，因此不能把员工自报当验收，也不能用未经核验的社区数字承诺节省比例。
 
 根据任务选择模式：
 
@@ -105,7 +116,11 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action capabil
 
 预算上限必须根据预计输入 token、缓存读取、工具轮次和输出规模估算，并留出完成最终回答的余量。不要给需要读取长日志或大 transcript 的任务设置无法覆盖首次完整处理的低预算；这类任务优先使用可信的结构化用量工具（如 `ccusage --json`）或本地确定性代码提取、去重并汇总 `input/output/cache creation/cache read`，再让 CC 只判断压缩后的元数据。发生 budget error 或状态异常时，先记录 result subtype、`session_id`、usage、费用和轮次，再用 session metadata 与一次最小 `poll` 取回可复用输出；只有确认无法恢复时才补充调用，禁止不看结果就直接重跑。用量审计必须区分“增加”“减少”和“证据不足”，不得把缺失数据解释为持平。
 
+发生 budget error 时必须做同会话收尾和复盘：先判断超支主要来自初始上下文、cache read、工具链回合、模型档位还是输出长度；保留已有工具结果和 partial output；按实际 usage 估算一个只够完成最终回答的小额补充预算，通过同一 session 明确要求停止新工具、压缩现有证据并立即交付。除非 session 无法恢复，不得新开会话重读。任务记录必须写明原预算、终止点、根因、恢复费用、最终是否交付和下次预算调整。
+
 **上下文档位**：`auto` 在 `NoTools` 时选择 `minimal`，其他任务选择 `project`。`minimal` 使用 safe mode，关闭 hooks、skills、plugins、MCP、memory 和 CLAUDE.md；`user` 只加载用户级配置并禁用 MCP，适合明确需要用户 skill 的文案工作；`project` 加载 user/project 规则并禁用 MCP，适合大多数代码和内置 WebSearch 调研；`full` 才继承全部 local 配置和 MCP。只有任务确实需要 MCP 时才使用 `full`。
+
+直接通过 Claude Code MCP 启动自定义 provider 时，不要为省上下文盲目设置 `settingSources=[]`：若认证链依赖 user settings，这会在推理前产生 401。先用无敏感输出的认证探针确认；需要 user settings 时保留 `settingSources=[user]`，再通过 `tools`、`strictAllowedTools`、短 prompt 和输出上限削减上下文。严格工具列表只能使用运行时目录中的精确名称；已有 `strictAllowedTools=true` 时不要再添加不存在的冗余 deny 工具。
 
 Claude Code 在自定义 `ANTHROPIC_BASE_URL` 下可能默认把 MCP schema 全量注入。`EnableToolSearch` 必须先用真实 MCP 调用验证兼容性，通过后再启用；它只在 `full` 档位且未使用 `NoTools` 时生效。不兼容时回退到 `project` 或显式最小 MCP 配置，不得盲目强制。wrapper 默认把 `MAX_MCP_OUTPUT_TOKENS` 设为 10000，长结果优先落盘后只返回路径、摘要和验证结论。
 
