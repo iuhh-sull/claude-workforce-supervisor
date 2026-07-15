@@ -455,7 +455,9 @@ exit 1
             $env:WORKFORCE_NAMESPACE = '---'
             $env:CF_TEST_ROSTER_FORMAT = $null
             $fallbackList = (& $scriptPath -Action list -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -All | ConvertFrom-Json)
-            if ($fallbackList.owner -ne 'cx-manual' -or $fallbackList.count -ne 1) {
+            $fallbackWorkers = @($fallbackList.workers)
+            $foreignFallbackWorkers = @($fallbackWorkers | Where-Object { [string]$_.name -notlike 'cx-manual-*' })
+            if ($fallbackList.owner -ne 'cx-manual' -or $fallbackList.count -lt 1 -or $foreignFallbackWorkers.Count -gt 0) {
                 throw 'An all-punctuation namespace did not fall back to cx-manual safely.'
             }
             $result.namespace_fallback = $true
