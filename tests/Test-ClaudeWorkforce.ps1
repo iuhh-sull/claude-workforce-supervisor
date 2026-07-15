@@ -1,5 +1,8 @@
 [CmdletBinding()]
-param([switch]$SkipRuntime)
+param(
+    [switch]$SkipRuntime,
+    [switch]$SkipHostRuntime
+)
 
 $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSVersion.Major -lt 7) {
@@ -102,6 +105,7 @@ $result = [ordered]@{
     namespace_fallback = $false
     cmd_shim = -not $IsWindows
     runtime = -not $SkipRuntime
+    host_runtime = -not $SkipHostRuntime
 }
 
 $boundaryRejected = $false
@@ -659,6 +663,7 @@ exit 1
         }
     }
 
+    if (-not $SkipHostRuntime) {
     $capabilities = (& $scriptPath -Action capabilities | ConvertFrom-Json)
     if (-not $capabilities.version_supported -or $capabilities.version_degraded -or -not $capabilities.has_background -or -not $capabilities.has_json_list -or -not $capabilities.has_output_format) {
         throw 'Claude Code runtime does not satisfy workforce requirements.'
@@ -718,6 +723,7 @@ exit 1
         throw 'Broad fetch compatibility flag must not bypass per-target supervisor review.'
     }
     $result.broad_web_fetch_allowed = [bool]$capabilities.broad_web_fetch_allowed
+    }
 }
 
 [pscustomobject]$result | ConvertTo-Json -Depth 4

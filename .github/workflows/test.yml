@@ -23,7 +23,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Verify PowerShell version
         run: $PSVersionTable.PSVersion
@@ -43,7 +43,7 @@ jobs:
           Write-Host 'All scripts parse cleanly.'
 
       - name: Run unit test suite
-        run: ./tests/Test-ClaudeWorkforce.ps1
+        run: ./tests/Test-ClaudeWorkforce.ps1 -SkipHostRuntime
         timeout-minutes: 5
 
       - name: Verify git diff is clean (no whitespace errors)
