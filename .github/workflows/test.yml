@@ -59,6 +59,7 @@ jobs:
         with:
           name: claude-workforce-fake-runtime-${{ github.run_attempt }}
           path: .test-results/*
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
 
@@ -91,6 +92,7 @@ jobs:
         with:
           name: claude-workforce-full-remediation-${{ github.run_attempt }}
           path: .test-results/*
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
 
