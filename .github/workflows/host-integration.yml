@@ -47,7 +47,7 @@ jobs:
       WORKFORCE_HOST_MODEL: ${{ inputs.model }}
       WORKFORCE_HOST_EFFORT: ${{ inputs.effort }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Confirm explicit real-host authorization
         run: |
@@ -70,6 +70,9 @@ jobs:
           if ($version -lt [version]'2.1.208') {
             throw "Claude Code 2.1.208 or newer is required; found $version."
           }
+          $sha256 = (Get-FileHash -LiteralPath $claude.Source -Algorithm SHA256).Hash
+          "WORKFORCE_CLAUDE_EXECUTABLE=$($claude.Source)" >> $env:GITHUB_ENV
+          "WORKFORCE_CLAUDE_SHA256=$sha256" >> $env:GITHUB_ENV
           Write-Host "Claude Code $version satisfies the 2.1.208 minimum."
 
       - name: Parse all scripts
@@ -86,13 +89,21 @@ jobs:
       - name: Run fake suite and real-host capability probes
         run: |
           New-Item -ItemType Directory -Path '.test-results' -Force | Out-Null
-          ./tests/Test-ClaudeWorkforce.ps1 |
+          ./tests/Test-ClaudeWorkforce.ps1 `
+            -TraceStages `
+            -TracePath '.test-results/host-capabilities.trace.log' `
+            -HostClaudeExecutable $env:WORKFORCE_CLAUDE_EXECUTABLE `
+            -HostClaudeSha256 $env:WORKFORCE_CLAUDE_SHA256 |
             Tee-Object -FilePath '.test-results/host-capabilities.json'
-        timeout-minutes: 10
+        timeout-minutes: 15
 
       - name: Exercise real start, list, daemon restart, reply, stop, and cleanup
         run: |
           $workforce = Join-Path $PWD 'claude-workforce/scripts/claude-workforce.ps1'
+          $claudeParameters = @{
+            ClaudeExecutable = $env:WORKFORCE_CLAUDE_EXECUTABLE
+            ExpectedClaudeSha256 = $env:WORKFORCE_CLAUDE_SHA256
+          }
           $stateRoot = Join-Path $env:RUNNER_TEMP "claude-workforce-host-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           $env:CLAUDE_WORKFORCE_STATE_ROOT = $stateRoot
           $workerId = $null
@@ -109,7 +120,7 @@ jobs:
           }
 
           try {
-            $start = (& $workforce -Action start -Mode inspect -NoTools `
+            $start = (& $workforce @claudeParameters -Action start -Mode inspect -NoTools `
               -Model $env:WORKFORCE_HOST_MODEL -Effort $env:WORKFORCE_HOST_EFFORT `
               -Role host-integration -Cwd $PWD -SessionRetentionPolicy manual `
               -Prompt 'Reply with exactly WORKFORCE_HOST_START_OK.' | ConvertFrom-Json)
@@ -122,7 +133,7 @@ jobs:
             $deadline = [DateTime]::UtcNow.AddMinutes(5)
             do {
               Start-Sleep -Seconds 5
-              $list = (& $workforce -Action list -All -AllThreads | ConvertFrom-Json)
+              $list = (& $workforce @claudeParameters -Action list -All -AllThreads | ConvertFrom-Json)
               $worker = @($list.workers | Where-Object { [string]$_.id -eq $workerId }) | Select-Object -First 1
               if (-not $worker) { throw "Started worker disappeared from Agent View roster: $workerId" }
               $summary.list = $true
@@ -130,17 +141,17 @@ jobs:
             } while ($active -and [DateTime]::UtcNow -lt $deadline)
             if ($active) { throw "Real worker did not reach a replyable state before timeout: $workerId" }
 
-            $daemonRestart = (& $workforce -Action daemon-restart-keep-workers | ConvertFrom-Json)
+            $daemonRestart = (& $workforce @claudeParameters -Action daemon-restart-keep-workers | ConvertFrom-Json)
             if ($daemonRestart.action -ne 'daemon-restart-keep-workers') {
               throw 'Daemon restart did not return the expected action.'
             }
-            $afterRestart = (& $workforce -Action list -All -AllThreads | ConvertFrom-Json)
+            $afterRestart = (& $workforce @claudeParameters -Action list -All -AllThreads | ConvertFrom-Json)
             if ($workerId -notin @($afterRestart.workers.id)) {
               throw "Worker was not retained across daemon restart: $workerId"
             }
             $summary.daemon_restart_keep_workers = $true
 
-            $reply = (& $workforce -Action reply -Id $workerId -AllThreads -Mode inspect -NoTools `
+            $reply = (& $workforce @claudeParameters -Action reply -Id $workerId -AllThreads -Mode inspect -NoTools `
               -Model $env:WORKFORCE_HOST_MODEL -Effort $env:WORKFORCE_HOST_EFFORT -MaxTurns 1 `
               -SessionRetentionPolicy manual -Prompt 'Reply with exactly WORKFORCE_HOST_REPLY_OK.' | ConvertFrom-Json)
             if ($reply.action -ne 'reply' -or [string]::IsNullOrWhiteSpace([string]$reply.session_id)) {
@@ -150,7 +161,7 @@ jobs:
           }
           finally {
             if (-not [string]::IsNullOrWhiteSpace($workerId)) {
-              $stop = (& $workforce -Action stop -Id $workerId -AllThreads `
+              $stop = (& $workforce @claudeParameters -Action stop -Id $workerId -AllThreads `
                 -GracefulShutdownSeconds 10 -PortReleaseTimeoutSeconds 15 | ConvertFrom-Json)
               if (-not $stop.worker_stopped -or $stop.cleanup_status -ne 'complete') {
                 throw "Real worker stop or cleanup was incomplete: $workerId"
@@ -168,10 +179,10 @@ jobs:
 
       - name: Upload host integration results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: claude-workforce-host-results-${{ github.run_attempt }}
-          path: .test-results/*.json
+          path: .test-results/*
           if-no-files-found: warn
           retention-days: 14
 

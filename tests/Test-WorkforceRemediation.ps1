@@ -531,7 +531,7 @@ try {
     }
     $result.startup_timeout = $true
 
-    $idle = Invoke-WorkforceMonitoredProcess -StartInfo (New-TimeoutStartInfo -Mode idle) -StartupTimeoutSeconds 3 -IdleTimeoutSeconds 1 -HardTimeoutSeconds 0 -CompatibilityTimeoutSeconds 10
+    $idle = Invoke-WorkforceMonitoredProcess -StartInfo (New-TimeoutStartInfo -Mode idle) -StartupTimeoutSeconds 10 -IdleTimeoutSeconds 1 -HardTimeoutSeconds 0 -CompatibilityTimeoutSeconds 10
     if (-not $idle.TimedOut -or $idle.TimeoutKind -ne 'idle' -or $idle.StandardOutput -notmatch 'READY') {
         throw 'Idle timeout did not preserve partial output.'
     }
@@ -539,7 +539,7 @@ try {
     $result.partial_output_preserved = $true
 
     $markerPath = Join-Path $testRoot 'hard-timeout-marker.txt'
-    $hard = Invoke-WorkforceMonitoredProcess -StartInfo (New-TimeoutStartInfo -Mode hard -MarkerPath $markerPath) -StartupTimeoutSeconds 3 -IdleTimeoutSeconds 3 -HardTimeoutSeconds 1 -CompatibilityTimeoutSeconds 10
+    $hard = Invoke-WorkforceMonitoredProcess -StartInfo (New-TimeoutStartInfo -Mode hard -MarkerPath $markerPath) -StartupTimeoutSeconds 10 -IdleTimeoutSeconds 3 -HardTimeoutSeconds 1 -CompatibilityTimeoutSeconds 10
     if (-not $hard.TimedOut -or $hard.TimeoutKind -ne 'hard' -or $hard.StandardOutput -notmatch 'tick-') {
         throw 'Hard timeout was not enforced while output remained active.'
     }

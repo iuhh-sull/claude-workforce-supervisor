@@ -1143,18 +1143,36 @@ function Get-WorkforcePortOwnerProcessIds {
     try {
         if ($IsWindows) {
             if ($Protocol -eq 'tcp' -and $null -ne (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) {
-                try {
-                    $processIds = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess -Unique)
-                    return [pscustomobject]@{ verified = $true; process_ids = @($processIds | ForEach-Object { [int]$_ }); reason = 'net-tcp' }
+                for ($attempt = 0; $attempt -lt 5; $attempt++) {
+                    try {
+                        $processIds = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess -Unique)
+                        if ($processIds.Count -gt 0) {
+                            return [pscustomobject]@{ verified = $true; process_ids = @($processIds | ForEach-Object { [int]$_ }); reason = 'net-tcp' }
+                        }
+                    }
+                    catch {
+                        break
+                    }
+                    if ($attempt -lt 4) {
+                        Start-Sleep -Milliseconds 100
+                    }
                 }
-                catch {}
             }
             if ($Protocol -eq 'udp' -and $null -ne (Get-Command Get-NetUDPEndpoint -ErrorAction SilentlyContinue)) {
-                try {
-                    $processIds = @(Get-NetUDPEndpoint -LocalPort $Port -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess -Unique)
-                    return [pscustomobject]@{ verified = $true; process_ids = @($processIds | ForEach-Object { [int]$_ }); reason = 'net-udp' }
+                for ($attempt = 0; $attempt -lt 5; $attempt++) {
+                    try {
+                        $processIds = @(Get-NetUDPEndpoint -LocalPort $Port -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess -Unique)
+                        if ($processIds.Count -gt 0) {
+                            return [pscustomobject]@{ verified = $true; process_ids = @($processIds | ForEach-Object { [int]$_ }); reason = 'net-udp' }
+                        }
+                    }
+                    catch {
+                        break
+                    }
+                    if ($attempt -lt 4) {
+                        Start-Sleep -Milliseconds 100
+                    }
                 }
-                catch {}
             }
             $netstat = Get-Command netstat.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($null -ne $netstat) {

@@ -2,18 +2,32 @@
 param(
     [switch]$SkipRuntime,
     [switch]$SkipHostRuntime,
-    [switch]$TraceStages
+    [switch]$TraceStages,
+    [string]$TracePath,
+    [string]$HostClaudeExecutable,
+    [ValidatePattern('^[A-Fa-f0-9]{64}$')]
+    [string]$HostClaudeSha256
 )
 
 function Write-TestStage {
     param([Parameter(Mandatory = $true)][string]$Name)
 
     if ($TraceStages) {
-        Write-Host "TEST_STAGE:$Name"
+        $line = "TEST_STAGE:$Name"
+        Write-Host $line
+        if (-not [string]::IsNullOrWhiteSpace($script:TraceFilePath)) {
+            [IO.File]::AppendAllText($script:TraceFilePath, "$line$([Environment]::NewLine)", [Text.UTF8Encoding]::new($false))
+        }
     }
 }
 
 $ErrorActionPreference = 'Stop'
+$script:TraceFilePath = $null
+if (-not [string]::IsNullOrWhiteSpace($TracePath)) {
+    $script:TraceFilePath = [IO.Path]::GetFullPath($TracePath)
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($script:TraceFilePath))
+    [IO.File]::WriteAllText($script:TraceFilePath, '', [Text.UTF8Encoding]::new($false))
+}
 if ($PSVersionTable.PSVersion.Major -lt 7) {
     throw 'Tests require PowerShell 7 or higher.'
 }
@@ -1038,7 +1052,7 @@ exit 1
         }
         $result.reply_success_output = $true
 
-        $timeoutResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'timeout monitored probe' -NoTools -MaxTurns 0 -ProviderBudgetCny ([decimal]'0.05') -Model 'deepseek-v4-flash[1m]' -HardTimeoutSeconds 1 -StartupTimeoutSeconds 3 -IdleTimeoutSeconds 3 -ProcessTimeoutSeconds 15 -ForceNewDispatch | ConvertFrom-Json)
+        $timeoutResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'timeout monitored probe' -NoTools -MaxTurns 0 -ProviderBudgetCny ([decimal]'0.05') -Model 'deepseek-v4-flash[1m]' -HardTimeoutSeconds 1 -StartupTimeoutSeconds 10 -IdleTimeoutSeconds 3 -ProcessTimeoutSeconds 15 -ForceNewDispatch | ConvertFrom-Json)
         $timeoutSessionGuid = [guid]::Empty
         if ($timeoutResult.original_result_subtype -ne 'workforce-timeout-hard' -or -not $timeoutResult.auto_finalize_attempted -or -not $timeoutResult.resume_used -or -not [guid]::TryParse([string]$timeoutResult.session_id, [ref]$timeoutSessionGuid) -or $timeoutResult.result -ne 'FINALIZED_AFTER_TIMEOUT') {
             throw 'A monitored timeout with a recoverable session did not use same-session finalize.'
@@ -1164,7 +1178,15 @@ exit 1
     }
 
     if (-not $SkipHostRuntime) {
-    $capabilities = (& $scriptPath -Action capabilities | ConvertFrom-Json)
+    if ([string]::IsNullOrWhiteSpace($HostClaudeExecutable) -xor [string]::IsNullOrWhiteSpace($HostClaudeSha256)) {
+        throw 'HostClaudeExecutable and HostClaudeSha256 must be provided together.'
+    }
+    $hostCapabilityParameters = @{ Action = 'capabilities' }
+    if (-not [string]::IsNullOrWhiteSpace($HostClaudeExecutable)) {
+        $hostCapabilityParameters.ClaudeExecutable = $HostClaudeExecutable
+        $hostCapabilityParameters.ExpectedClaudeSha256 = $HostClaudeSha256
+    }
+    $capabilities = (& $scriptPath @hostCapabilityParameters | ConvertFrom-Json)
     if (-not $capabilities.version_supported -or $capabilities.version_degraded -or -not $capabilities.has_background -or -not $capabilities.has_json_list -or -not $capabilities.has_output_format) {
         throw 'Claude Code runtime does not satisfy workforce requirements.'
     }

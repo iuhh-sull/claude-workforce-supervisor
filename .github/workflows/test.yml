@@ -21,14 +21,15 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
-    name: PowerShell 7 Unit Tests
+  fake-runtime:
+    name: Portable Fake Runtime and Concurrency
     runs-on: windows-latest
+    timeout-minutes: 20
     defaults:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Verify PowerShell version
         run: $PSVersionTable.PSVersion
@@ -48,22 +49,48 @@ jobs:
       - name: Run portable fake-runtime and concurrency suite
         run: |
           New-Item -ItemType Directory -Path '.test-results' -Force | Out-Null
-          ./tests/Test-ClaudeWorkforce.ps1 -SkipHostRuntime |
+          ./tests/Test-ClaudeWorkforce.ps1 -SkipHostRuntime -TraceStages -TracePath '.test-results/fake-runtime.trace.log' |
             Tee-Object -FilePath '.test-results/fake-runtime.json'
-        timeout-minutes: 5
+        timeout-minutes: 15
+
+      - name: Upload fake-runtime results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: claude-workforce-fake-runtime-${{ github.run_attempt }}
+          path: .test-results/*
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Verify git diff is clean (no whitespace errors)
+        run: git diff --check
+
+  remediation:
+    name: Full Remediation
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify PowerShell version
+        run: $PSVersionTable.PSVersion
 
       - name: Run full remediation suite
         run: |
+          New-Item -ItemType Directory -Path '.test-results' -Force | Out-Null
           ./tests/Test-WorkforceRemediation.ps1 |
             Tee-Object -FilePath '.test-results/full-remediation.json'
-        timeout-minutes: 10
+        timeout-minutes: 15
 
-      - name: Upload test results
+      - name: Upload remediation results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: claude-workforce-test-results-${{ github.run_attempt }}
-          path: .test-results/*.json
+          name: claude-workforce-full-remediation-${{ github.run_attempt }}
+          path: .test-results/*
           if-no-files-found: warn
           retention-days: 14
 

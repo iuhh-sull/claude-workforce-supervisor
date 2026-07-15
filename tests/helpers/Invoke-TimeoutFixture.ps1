@@ -23,6 +23,6 @@ switch ($Mode) {
         }
     }
     'hold' {
-        Start-Sleep -Seconds 10
+        Start-Sleep -Seconds 60
     }
 }
