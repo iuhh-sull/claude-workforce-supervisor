@@ -168,6 +168,26 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action start -
 
 不要在 prompt 中放 token、密码、私有端点、仓库 remote、分支名或身份信息。脚本会附加禁止提交、推送、发布、部署、开 PR、删除 worktree、访问专用凭据库和抓取私网目标的约束，并用 session ask/allow 与 MCP 逐次审批实施分级控制。敏感 Read 一旦获批，内容可能进入持久 transcript；批准前必须确认任务必要性和输出脱敏。
 
+## 资源生命周期与连接恢复
+
+`run`、`start`、`reply` 前会执行内置 reconcile。默认 `-InvocationLevel medium -ConcurrencyPolicy adaptive -ResourcePolicy retain-session -SessionRetentionPolicy stop-on-complete`：稳定并发 4、burst 6、nested agents 最多 2；保留 transcript，但完成后清理临时进程和端口。
+
+三档是软上限，不是启动目标：low=2/3/0、medium=4/6/2、high=6/10/4（stable/burst/nested）。超过 stable 必须显式同时使用 `-AllowBurst -IndependentTask` 且 circuit closed。连接异常时按 2→1、4→2→1、6→3→1 降级；circuit open 时新 dispatch 为 0。
+
+```powershell
+pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action reconcile -Cwd "<project>" -Role researcher -Prompt "<task>"
+pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action resources
+pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action ports
+pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action doctor -Cwd "<project>"
+pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action daemon-restart-keep-workers
+```
+
+可重试 API 错误只允许一次原 session `--resume`，不得创建替代 worker；401/403、认证、invalid model、TLS 校验、DNS 配置和 unsupported endpoint 不自动重试。HTTP/SSE 与 stdio MCP 分开处理，startup/idle/tool timeout 不与整个 CC session timeout 混用。
+
+每次 lifecycle action 至少返回 `reconcile_performed`、`cleanup_status`、`owned_processes_remaining`、`owned_ports_remaining`、`api_circuit_state`、重试次数和并发降级状态，调用方不得只看模型文本判断任务是否真正结束。
+
+详细规则见 `references/resource-lifecycle.md`、`connectivity.md`、`port-management.md`、`invocation-levels.md`、`operations.md` 和 `troubleshooting.md`。
+
 ## 监控与验收
 
 列出当前 Codex task 的员工：
@@ -281,7 +301,7 @@ pwsh -NoProfile -File "<skill-dir>/scripts/claude-workforce.ps1" -Action remove 
 
 **脚本只允许删除 `stopped`、`completed`、`failed`、`error`、`dead`、`cancelled`、`exited` 等明确终态的员工；其他状态、状态缺失或无法识别时都失败关闭**。必须先 `stop`、刷新 roster 并确认状态明确，再 `remove`。
 
-不要自动清理已完成员工；保留它们才能隔很久后找回继续聊。
+默认 `retain-session` + `stop-on-complete` 会停止运行进程并释放临时资源，但保留可恢复 session。只有显式 `remove-on-complete`、到期的 `idle-ttl` 或人工双确认 remove 才删除 session；worktree 不干净或终态未验证时必须失败关闭。
 
 ## 会话版本与 Git 来源
 

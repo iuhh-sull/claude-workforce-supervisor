@@ -139,6 +139,31 @@ Treat `maxTurns` as a requested boundary that must be checked against the return
 
 Every new persistent worker name includes a workforce-profile version and a fingerprint derived from its launch repository root, origin, branch, and commit. `start` returns the locally sanitized source fields to Codex, but sends only the source kind and irreversible fingerprint in the CC prompt. `reply` recomputes the fingerprint and stops on an old unversioned worker or a changed fork/branch/commit. After manual review, `-AllowLegacySession` can resume a pre-version worker and `-AllowProvenanceDrift` can accept an intentional Git change. Existing processes do not inherit a newly installed profile retroactively; start a new worker when the permission model changes.
 
+## Resource lifecycle and connectivity
+
+Every dispatch runs `reconcile` before acquisition. The wrapper fingerprints namespace/cwd/role/task, prevents duplicate work, reuses completed manifests, checks provider/model circuit state, and applies soft concurrency ceilings:
+
+| Level | Stable active | Burst | Nested agents |
+|---|---:|---:|---:|
+| low | 2 | 3 | 0 |
+| medium | 4 | 6 | 2 |
+| high | 6 | 10 | 4 |
+
+`retain-session` plus `stop-on-complete` are the defaults: transcript metadata remains resumable, while temporary processes and ports are released. `-ResourcePolicy` accepts `cleanup`, `retain-session`, and `keep-resources`; `-SessionRetentionPolicy` accepts `stop-on-complete`, `remove-on-complete`, `idle-ttl`, and `manual`. Automatic removal fails closed unless the Agent View worker is terminal and its Git worktree is verified clean. Print-mode `run` sessions are retained for same-session recovery; use `-Ephemeral` when their transcript may be discarded.
+
+```powershell
+pwsh -NoProfile -File $workforce -Action reconcile -Cwd $project -Role researcher -Prompt '<task>'
+pwsh -NoProfile -File $workforce -Action resources
+pwsh -NoProfile -File $workforce -Action ports
+pwsh -NoProfile -File $workforce -Action doctor -Cwd $project
+pwsh -NoProfile -File $workforce -Action daemon-restart-keep-workers
+pwsh -NoProfile -File $workforce -Action stop -Id '<worker-id>' -GracefulShutdownSeconds 10 -PortReleaseTimeoutSeconds 15
+```
+
+Retryable provider failures perform at most one same-session recovery and retain partial output. Authentication, invalid-model, TLS-validation, DNS-configuration, and unsupported-endpoint failures never auto-retry. Circuit-open state freezes new dispatch. HTTP/SSE and stdio MCP recovery use distinct policies and startup/idle/tool timeouts.
+
+State lives under `~/.codex/claude-workforce/` by default. Output includes `cleanup_status`, remaining owned process/port counts, retry counts, reuse decisions, and concurrency reduction. See the focused references under `claude-workforce/references/`.
+
 ## Windows note
 
 Native Windows doesn't provide a full OS sandbox for Claude Code. Session rules and MCP approval act at the tool level, not at the OS level. Don't rely on this for sandboxing.
@@ -160,7 +185,9 @@ claude-workforce/
   agents/openai.yaml       # OpenAI-compatible agent definition
   scripts/
     claude-workforce.ps1   # Core wrapper
+    workforce-lifecycle.ps1 # State, leases, circuits, ownership, cleanup
     new-workforce-session-profile.ps1 # Session-only MCP/worker settings
+  references/              # Lifecycle, connectivity, ports, levels, operations, troubleshooting
 Install.ps1                # Install script
 tests/
   Test-ClaudeWorkforce.ps1 # Parse check + runtime permission probe

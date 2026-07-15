@@ -4,7 +4,19 @@ param(
     [string]$Output = 'settings',
     [ValidateSet('minimal', 'user', 'project', 'full')]
     [string]$ContextProfile = 'project',
-    [switch]$AllowNestedAgents
+    [switch]$AllowNestedAgents,
+    [ValidateSet('low', 'medium', 'high')]
+    [string]$InvocationLevel = 'medium',
+    [ValidateSet('cleanup', 'retain-session', 'keep-resources')]
+    [string]$ResourcePolicy = 'retain-session',
+    [ValidateSet('stop-on-complete', 'remove-on-complete', 'idle-ttl', 'manual')]
+    [string]$SessionRetentionPolicy = 'stop-on-complete',
+    [ValidateRange(1, 3600)]
+    [int]$McpStartupTimeoutSeconds = 60,
+    [ValidateRange(1, 86400)]
+    [int]$McpIdleTimeoutSeconds = 600,
+    [ValidateRange(1, 86400)]
+    [int]$McpToolTimeoutSeconds = 300
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,6 +78,19 @@ $settingSources = switch ($ContextProfile) {
     allowedTools = @()
     disallowedTools = @()
     strictAllowedTools = $false
+    lifecycle = [ordered]@{
+        schema_version = 1
+        invocation_level = $InvocationLevel
+        resource_policy = $ResourcePolicy
+        session_retention_policy = $SessionRetentionPolicy
+        mcp_startup_timeout_seconds = $McpStartupTimeoutSeconds
+        mcp_idle_timeout_seconds = $McpIdleTimeoutSeconds
+        mcp_tool_timeout_seconds = $McpToolTimeoutSeconds
+        recovery = [ordered]@{
+            http_sse = 'wait-for-internal-reconnect-then-restart-confirmed-dead-service-once'
+            stdio = 'verify-owned-child-exit-then-restart-once'
+        }
+    }
     advanced = [ordered]@{
         settingSources = $settingSources
         settings = $settings

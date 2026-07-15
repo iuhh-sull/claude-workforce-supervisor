@@ -133,6 +133,31 @@ Agent 默认走 ask。只有传了 `-AllowNestedAgents` 才会在当前员工会
 
 每个新建的持久员工都会在名称中带上 workforce profile 版本和来源指纹。指纹由启动时的仓库根、origin、分支和 commit 共同生成；`start` 只把本地脱敏后的来源字段返回给 Codex，发给 CC 的任务合同只有来源类型和不可逆指纹。`reply` 会重新计算，遇到没有版本标记的旧员工，或 fork、分支、commit 已变化时默认停止。核对日志和 Git 状态后，可以用 `-AllowLegacySession` 接回老员工，或用 `-AllowProvenanceDrift` 接受有意的来源变化。已经运行的进程不会自动继承后来安装的新 profile；权限模型升级后应新开员工。
 
+## 资源生命周期与连接恢复
+
+每次 dispatch 前都会先执行 `reconcile`：计算 namespace/cwd/role/task 指纹，阻止重复任务，复用已完成 manifest，检查 provider/model 熔断状态，并应用软并发上限：
+
+| 档位 | 稳定 active | Burst | Nested agents |
+|---|---:|---:|---:|
+| low | 2 | 3 | 0 |
+| medium | 4 | 6 | 2 |
+| high | 6 | 10 | 4 |
+
+默认是 `retain-session` + `stop-on-complete`：transcript 和 session metadata 可续接，但临时进程和端口必须释放。`-ResourcePolicy` 支持 `cleanup`、`retain-session`、`keep-resources`；`-SessionRetentionPolicy` 支持 `stop-on-complete`、`remove-on-complete`、`idle-ttl`、`manual`。自动删除仅在 Agent View worker 已验证终态且 Git worktree 已验证干净时执行，否则失败关闭。print-mode `run` 会为 same-session 恢复保留 session；若 transcript 可丢弃，请使用 `-Ephemeral`。
+
+```powershell
+pwsh -NoProfile -File $workforce -Action reconcile -Cwd $project -Role researcher -Prompt '<任务>'
+pwsh -NoProfile -File $workforce -Action resources
+pwsh -NoProfile -File $workforce -Action ports
+pwsh -NoProfile -File $workforce -Action doctor -Cwd $project
+pwsh -NoProfile -File $workforce -Action daemon-restart-keep-workers
+pwsh -NoProfile -File $workforce -Action stop -Id '<worker-id>' -GracefulShutdownSeconds 10 -PortReleaseTimeoutSeconds 15
+```
+
+可重试 provider 错误最多进行一次同 session 恢复，并保留 partial output。认证、模型、TLS 校验、DNS 配置和不支持的 endpoint 错误不会自动重试。circuit open 时冻结新 dispatch。HTTP/SSE MCP 与 stdio MCP 使用不同恢复规则，startup/idle/tool timeout 也彼此独立。
+
+状态默认位于 `~/.codex/claude-workforce/`。每次 action 返回 `cleanup_status`、剩余 owned process/port、重试次数、session 复用和并发降级等审计字段。详细说明见 `claude-workforce/references/`。
+
 ## Windows 说明
 
 原生 Windows 没有 Claude Code 的完整 OS 沙箱。session 规则和 MCP 审批只在工具层面约束，不会在 OS 层阻止文件读取或进程执行。别当沙箱用。
@@ -154,7 +179,9 @@ claude-workforce/
   agents/openai.yaml       # OpenAI-compatible agent 定义
   scripts/
     claude-workforce.ps1   # 核心 wrapper
+    workforce-lifecycle.ps1 # 状态、租约、熔断、所有权与清理
     new-workforce-session-profile.ps1 # 仅当前 MCP/员工会话使用的配置
+  references/              # 生命周期、连接、端口、并发、运维、排障
 Install.ps1                # 安装脚本
 tests/
   Test-ClaudeWorkforce.ps1 # 解析检查 + 运行时权限探针
