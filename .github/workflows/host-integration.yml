@@ -1,0 +1,179 @@
+name: Manual Claude Host Integration
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      acknowledgement:
+        description: 'Real Claude test: writes ~/.claude, creates sessions/workers, uses network, and may incur provider charges.'
+        required: true
+        default: 'NO'
+        type: choice
+        options:
+          - 'NO'
+          - 'I_UNDERSTAND_AND_ACCEPT_REAL_HOST_SIDE_EFFECTS'
+      model:
+        description: 'Claude Code model/provider model used by the real start and reply smoke test.'
+        required: true
+        default: 'deepseek-v4-flash[1m]'
+        type: string
+      effort:
+        description: 'Reasoning effort used by the real start and reply smoke test.'
+        required: true
+        default: 'low'
+        type: choice
+        options:
+          - low
+          - medium
+          - high
+          - max
+
+concurrency:
+  group: claude-workforce-real-host-integration
+  cancel-in-progress: false
+
+jobs:
+  host-integration:
+    name: Real Claude Code and Agent View
+    if: inputs.acknowledgement == 'I_UNDERSTAND_AND_ACCEPT_REAL_HOST_SIDE_EFFECTS'
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      WORKFORCE_HOST_MODEL: ${{ inputs.model }}
+      WORKFORCE_HOST_EFFORT: ${{ inputs.effort }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Confirm explicit real-host authorization
+        run: |
+          if ('${{ inputs.acknowledgement }}' -ne 'I_UNDERSTAND_AND_ACCEPT_REAL_HOST_SIDE_EFFECTS') {
+            throw 'Real host integration requires explicit acknowledgement.'
+          }
+          Write-Host 'Authorized manual run: this job may modify ~/.claude, access the network, create real workers, and incur provider charges.'
+
+      - name: Verify host prerequisites
+        run: |
+          if (-not $IsWindows) { throw 'This workflow requires a Windows self-hosted runner.' }
+          if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'PowerShell 7 or higher is required.' }
+          $claude = Get-Command claude -CommandType Application -ErrorAction Stop
+          $versionText = (& $claude.Source --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Claude Code version probe failed.' }
+          if ($versionText -notmatch '(?<version>\d+\.\d+\.\d+)') {
+            throw "Unable to parse Claude Code version: $versionText"
+          }
+          $version = [version]$Matches.version
+          if ($version -lt [version]'2.1.208') {
+            throw "Claude Code 2.1.208 or newer is required; found $version."
+          }
+          Write-Host "Claude Code $version satisfies the 2.1.208 minimum."
+
+      - name: Parse all scripts
+        run: |
+          $paths = @(Get-ChildItem -LiteralPath . -Filter '*.ps1' -File -Recurse | Sort-Object FullName)
+          if ($paths.Count -eq 0) { throw 'No PowerShell scripts were found.' }
+          foreach ($path in $paths) {
+            $tokens = $null
+            $errors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile($path.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) { throw "$($path.FullName) : $($errors[0].Message)" }
+          }
+
+      - name: Run fake suite and real-host capability probes
+        run: |
+          New-Item -ItemType Directory -Path '.test-results' -Force | Out-Null
+          ./tests/Test-ClaudeWorkforce.ps1 |
+            Tee-Object -FilePath '.test-results/host-capabilities.json'
+        timeout-minutes: 10
+
+      - name: Exercise real start, list, daemon restart, reply, stop, and cleanup
+        run: |
+          $workforce = Join-Path $PWD 'claude-workforce/scripts/claude-workforce.ps1'
+          $stateRoot = Join-Path $env:RUNNER_TEMP "claude-workforce-host-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $env:CLAUDE_WORKFORCE_STATE_ROOT = $stateRoot
+          $workerId = $null
+          $summary = [ordered]@{
+            model = $env:WORKFORCE_HOST_MODEL
+            effort = $env:WORKFORCE_HOST_EFFORT
+            state_root_is_ephemeral = $true
+            start = $false
+            list = $false
+            daemon_restart_keep_workers = $false
+            reply = $false
+            stop = $false
+            port_release_verified = $false
+          }
+
+          try {
+            $start = (& $workforce -Action start -Mode inspect -NoTools `
+              -Model $env:WORKFORCE_HOST_MODEL -Effort $env:WORKFORCE_HOST_EFFORT `
+              -Role host-integration -Cwd $PWD -SessionRetentionPolicy manual `
+              -Prompt 'Reply with exactly WORKFORCE_HOST_START_OK.' | ConvertFrom-Json)
+            $workerId = [string]$start.worker_id
+            if ([string]::IsNullOrWhiteSpace($workerId)) {
+              throw 'Real start did not return a canonical worker ID.'
+            }
+            $summary.start = $true
+
+            $deadline = [DateTime]::UtcNow.AddMinutes(5)
+            do {
+              Start-Sleep -Seconds 5
+              $list = (& $workforce -Action list -All -AllThreads | ConvertFrom-Json)
+              $worker = @($list.workers | Where-Object { [string]$_.id -eq $workerId }) | Select-Object -First 1
+              if (-not $worker) { throw "Started worker disappeared from Agent View roster: $workerId" }
+              $summary.list = $true
+              $active = [string]$worker.state -match '^(queued|starting|working|running)$'
+            } while ($active -and [DateTime]::UtcNow -lt $deadline)
+            if ($active) { throw "Real worker did not reach a replyable state before timeout: $workerId" }
+
+            $daemonRestart = (& $workforce -Action daemon-restart-keep-workers | ConvertFrom-Json)
+            if ($daemonRestart.action -ne 'daemon-restart-keep-workers') {
+              throw 'Daemon restart did not return the expected action.'
+            }
+            $afterRestart = (& $workforce -Action list -All -AllThreads | ConvertFrom-Json)
+            if ($workerId -notin @($afterRestart.workers.id)) {
+              throw "Worker was not retained across daemon restart: $workerId"
+            }
+            $summary.daemon_restart_keep_workers = $true
+
+            $reply = (& $workforce -Action reply -Id $workerId -AllThreads -Mode inspect -NoTools `
+              -Model $env:WORKFORCE_HOST_MODEL -Effort $env:WORKFORCE_HOST_EFFORT -MaxTurns 1 `
+              -SessionRetentionPolicy manual -Prompt 'Reply with exactly WORKFORCE_HOST_REPLY_OK.' | ConvertFrom-Json)
+            if ($reply.action -ne 'reply' -or [string]::IsNullOrWhiteSpace([string]$reply.session_id)) {
+              throw 'Real reply did not resume the original session.'
+            }
+            $summary.reply = $true
+          }
+          finally {
+            if (-not [string]::IsNullOrWhiteSpace($workerId)) {
+              $stop = (& $workforce -Action stop -Id $workerId -AllThreads `
+                -GracefulShutdownSeconds 10 -PortReleaseTimeoutSeconds 15 | ConvertFrom-Json)
+              if (-not $stop.worker_stopped -or $stop.cleanup_status -ne 'complete') {
+                throw "Real worker stop or cleanup was incomplete: $workerId"
+              }
+              if ($stop.owned_ports_remaining -ne 0) {
+                throw "Owned ports remained after real worker stop: $workerId"
+              }
+              $summary.stop = $true
+              $summary.port_release_verified = $true
+            }
+            $summary | ConvertTo-Json -Depth 4 |
+              Set-Content -LiteralPath '.test-results/real-host-lifecycle.json' -Encoding UTF8
+          }
+        timeout-minutes: 15
+
+      - name: Upload host integration results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-workforce-host-results-${{ github.run_attempt }}
+          path: .test-results/*.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Verify git diff is clean (no whitespace errors)
+        run: git diff --check

@@ -18,12 +18,12 @@ Use `doctor` to inspect circuit state and `reconcile` to see whether dispatch is
 
 ## MCP
 
-MCP startup, idle, and tool timeouts are separate from the whole Claude process timeout. They are exposed in the session-only MCP profile and child-process environment.
+MCP startup, idle, and tool timeouts are separate from the wrapper-enforced Claude process startup, idle, and hard timeouts. Each output distinguishes `configured`, `enforced`, and `reported-only`; environment configuration alone is not proof of enforcement.
 
 - HTTP/SSE: wait for Claude Code's internal reconnect, check endpoint/lease/circuit state, and restart only a confirmed dead service once.
 - stdio: verify the registered owned child exited, restart it once, then mark failure.
 
-The wrapper does not discover or kill unregistered MCP services. Register long-lived MCP processes and ports in the resource manifest before relying on cleanup.
+The wrapper does not discover or kill unregistered MCP services. Register long-lived MCP processes, endpoints, and listener ports through the resource broker. Worker reports and Manifest text are not ownership proof; recovery or cleanup requires a broker HMAC and matching process/listener identity.
 
 ## Partial output
 

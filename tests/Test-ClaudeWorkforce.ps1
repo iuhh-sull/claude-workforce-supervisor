@@ -1,8 +1,17 @@
 [CmdletBinding()]
 param(
     [switch]$SkipRuntime,
-    [switch]$SkipHostRuntime
+    [switch]$SkipHostRuntime,
+    [switch]$TraceStages
 )
+
+function Write-TestStage {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    if ($TraceStages) {
+        Write-Host "TEST_STAGE:$Name"
+    }
+}
 
 $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSVersion.Major -lt 7) {
@@ -103,6 +112,13 @@ $result = [ordered]@{
     roster_compact_parsed = $false
     roster_log_prefix_compact_parsed = $false
     roster_log_prefix_pretty_parsed = $false
+    roster_ansi_multi_bracket_parsed = $false
+    roster_trailing_logs_rejected = $false
+    result_multi_json_selected = $false
+    max_turns_zero_omitted = $false
+    capability_cache_ttl_hash = $false
+    attach_canonical_id = $false
+    timeout_same_session_finalize = $false
     mcp_profile = $false
     local_remote_redacted = $false
     credential_remote_redacted = $false
@@ -148,7 +164,11 @@ $env:CLAUDE_WORKFORCE_STATE_ROOT = $stateRoot
 $paths = Initialize-WorkforceState -StateRoot $stateRoot
 if (-not (Test-Path -LiteralPath $paths.port_leases -PathType Leaf) -or
     -not (Test-Path -LiteralPath $paths.circuit_breakers -PathType Leaf) -or
-    -not (Test-Path -LiteralPath $paths.resource_index -PathType Leaf)) {
+    -not (Test-Path -LiteralPath $paths.state_version -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $paths.manifests -PathType Container) -or
+    -not (Test-Path -LiteralPath $paths.worker_reports -PathType Container) -or
+    -not (Test-Path -LiteralPath $paths.broker_resources -PathType Container) -or
+    (Test-Path -LiteralPath $paths.resource_index -PathType Leaf)) {
     throw 'Lifecycle state files were not initialized.'
 }
 if (@(Get-WorkforcePortLeases -StateRoot $stateRoot).Count -ne 0 -or @(Get-WorkforceManifests -StateRoot $stateRoot).Count -ne 0) {
@@ -305,7 +325,7 @@ if (-not $boundaryRejected) {
 }
 $result.installer_boundary = $true
 
-$mcpProfile = & $profilePath -Output mcp -ContextProfile project | ConvertFrom-Json -ErrorAction Stop
+$mcpProfile = & $profilePath -Output mcp -ContextProfile project -TrustProfile strict | ConvertFrom-Json -ErrorAction Stop
 if ($mcpProfile.purpose -ne 'codex-claude-workforce-session-only' -or $mcpProfile.schema_version -ne 1) {
     throw 'MCP workforce profile identity is invalid.'
 }
@@ -344,7 +364,7 @@ foreach ($rule in @('Read(**/.env)', 'Read(~/.codex/auth.json)', 'Read(~/.claude
         throw "MCP profile is missing sensitive-read review rule: $rule"
     }
 }
-$nestedProfile = & $profilePath -Output mcp -ContextProfile project -AllowNestedAgents | ConvertFrom-Json -ErrorAction Stop
+$nestedProfile = & $profilePath -Output mcp -ContextProfile project -TrustProfile strict -AllowNestedAgents | ConvertFrom-Json -ErrorAction Stop
 if ('Agent' -notin @($nestedProfile.settings.permissions.allow) -or 'Agent' -in @($nestedProfile.settings.permissions.ask) -or
     'Task' -notin @($nestedProfile.settings.permissions.allow) -or 'Task' -in @($nestedProfile.settings.permissions.ask)) {
     throw 'Explicit nested-agent authorization was not scoped into the MCP session profile.'
@@ -362,8 +382,9 @@ if (-not $SkipRuntime) {
 $fakeSource = @'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Remaining)
 $rosterFile = Join-Path ([IO.Path]::GetTempPath()) ((Split-Path -LeafBase $PSCommandPath) + '-roster.json')
+$timeoutSessionFile = "$rosterFile.timeout-session"
 if ('--version' -in $Remaining) {
-    '2.1.207 (Claude Code)'
+    '2.1.208 (Claude Code)'
     exit 0
 }
 if ($Remaining.Count -ge 2 -and $Remaining[0] -eq 'agents' -and $Remaining[1] -eq '--help') {
@@ -380,6 +401,13 @@ if ($Remaining.Count -ge 2 -and $Remaining[0] -eq 'daemon') {
 }
 if ($Remaining.Count -ge 1 -and $Remaining[0] -eq 'stop') {
     'WORKER_STOPPED'
+    exit 0
+}
+if ($Remaining.Count -ge 1 -and $Remaining[0] -eq 'attach') {
+    if (-not [string]::IsNullOrWhiteSpace($env:CF_TEST_ATTACH_MARKER)) {
+        $Remaining[1] | Set-Content -LiteralPath $env:CF_TEST_ATTACH_MARKER -Encoding UTF8
+    }
+    'WORKER_ATTACHED'
     exit 0
 }
 if ($Remaining.Count -ge 1 -and $Remaining[0] -eq 'rm') {
@@ -406,6 +434,18 @@ if ($Remaining.Count -ge 2 -and $Remaining[0] -eq 'agents' -and $Remaining[1] -e
     }
     if ($rosterFormat -eq 'log-prefix-pretty') {
         '[2026-07-14 12:00:00] daemon started' + [Environment]::NewLine + '[' + [Environment]::NewLine + '  {"id":"pretty-a","name":"pretty-test","sessionId":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","cwd":"' + $escapedCwd + '","state":"done"}' + [Environment]::NewLine + ']'
+        exit 0
+    }
+    if ($rosterFormat -eq 'ansi-multi-bracket') {
+        $escape = [char]27
+        "$escape[32mdaemon log$escape[0m"
+        '{"event":"daemon","message":"prefix object"}'
+        '[{"id":"complex-a","name":"bracket ] worker","sessionId":"abababab-abab-4bab-8bab-abababababab","cwd":"' + $escapedCwd + '","state":"done"}]'
+        exit 0
+    }
+    if ($rosterFormat -eq 'trailing-logs') {
+        '[{"id":"trailing-a","name":"trailing-test","sessionId":"bcbcbcbc-bcbc-4cbc-8cbc-bcbcbcbcbcbc","cwd":"' + $escapedCwd + '","state":"done"}]'
+        'unexpected trailing log'
         exit 0
     }
     if ($rosterFormat -eq 'namespace') {
@@ -482,6 +522,30 @@ if ($env:CF_TEST_API_MODE -eq 'nonretryable') {
     '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"session_id":"88888888-8888-4888-8888-888888888888","total_cost_usd":0.01,"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5},"result":"401 invalid API key"}'
     exit 1
 }
+$joinedArguments = $Remaining -join ' '
+if ($joinedArguments -like '*timeout monitored probe*') {
+    $sessionIdIndex = [Array]::IndexOf($Remaining, '--session-id')
+    if ($sessionIdIndex -lt 0 -or ($sessionIdIndex + 1) -ge $Remaining.Count) {
+        throw 'timeout probe requires a preallocated session ID'
+    }
+    $Remaining[$sessionIdIndex + 1] | Set-Content -LiteralPath $timeoutSessionFile -Encoding UTF8
+    'PARTIAL_BEFORE_TIMEOUT'
+    [Console]::Out.Flush()
+    Start-Sleep -Seconds 10
+    exit 0
+}
+$resumeIndex = [Array]::IndexOf($Remaining, '--resume')
+if ($resumeIndex -ge 0 -and ($resumeIndex + 1) -lt $Remaining.Count -and (Test-Path -LiteralPath $timeoutSessionFile -PathType Leaf)) {
+    $timeoutSessionId = (Get-Content -LiteralPath $timeoutSessionFile -Raw -Encoding UTF8).Trim()
+    if ($Remaining[$resumeIndex + 1] -eq $timeoutSessionId) {
+        '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"' + $timeoutSessionId + '","usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":5,"output_tokens":3},"result":"FINALIZED_AFTER_TIMEOUT"}'
+        exit 0
+    }
+}
+if ($resumeIndex -ge 0 -and ($resumeIndex + 1) -lt $Remaining.Count -and $Remaining[$resumeIndex + 1] -eq '11111111-1111-4111-8111-111111111111') {
+    '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"11111111-1111-4111-8111-111111111111","total_cost_usd":0.01,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":20,"output_tokens":10},"result":"FINALIZED_FROM_EXISTING_CONTEXT"}'
+    exit 0
+}
 if ('--resume' -in $Remaining) {
     '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"44444444-4444-4444-8444-444444444444","total_cost_usd":0.25,"usage":{"input_tokens":100,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40},"result":"REPLY_OK"}'
     exit 0
@@ -502,6 +566,26 @@ if (($Remaining -join ' ') -like '*NoTools isolation probe*') {
         usage = [ordered]@{input_tokens=1;cache_creation_input_tokens=0;cache_read_input_tokens=0;output_tokens=1}
         result = "HAS_SAFE_MODE=$hasSafeMode"
     } | ConvertTo-Json -Compress
+    exit 0
+}
+if (($Remaining -join ' ') -like '*max turns zero probe*') {
+    $hasMaxTurns = '--max-turns' -in $Remaining
+    [ordered]@{
+        type = 'result'
+        subtype = 'success'
+        is_error = $false
+        num_turns = 1
+        session_id = '81818181-8181-4181-8181-818181818181'
+        usage = [ordered]@{input_tokens=1;cache_creation_input_tokens=0;cache_read_input_tokens=0;output_tokens=1}
+        result = "MAX_TURNS_PRESENT=$hasMaxTurns"
+    } | ConvertTo-Json -Compress
+    exit 0
+}
+if (($Remaining -join ' ') -like '*multi result probe*') {
+    $escape = [char]27
+    "$escape[33mresult prefix$escape[0m"
+    '{"event":"diagnostic","message":"ignore me"}'
+    '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"82828282-8282-4282-8282-828282828282","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1},"result":"SELECTED_RESULT"}'
     exit 0
 }
 if (($Remaining -join ' ') -like '*provider soft budget probe*') {
@@ -529,6 +613,7 @@ if (($Remaining -join ' ') -like '*provider soft budget probe*') {
 exit 1
 '@
     [IO.File]::WriteAllText($fakeClaude, $fakeSource, [Text.UTF8Encoding]::new($false))
+    Write-TestStage -Name 'fake-runtime-start'
     $localOriginRepo = $null
     try {
         $fakeHash = (Get-FileHash -LiteralPath $fakeClaude -Algorithm SHA256).Hash
@@ -538,12 +623,38 @@ exit 1
             throw 'Invocation-level or MCP timeout linkage is incorrect.'
         }
         $result.timeout_profile_linkage = $true
+        $capabilityCachePath = (Get-WorkforceStatePaths -StateRoot $stateRoot).capability_cache
+        $cachedState = Read-WorkforceState -Path $capabilityCachePath -DefaultValue $null -RestoreFromBackup
+        $cachedEntry = @($cachedState.entries | Select-Object -First 1)[0]
+        $cachedEntry.version = '9.9.9'
+        $cachedEntry.expires_at = [DateTimeOffset]::UtcNow.AddHours(1).ToString('o')
+        Write-WorkforceState -Path $capabilityCachePath -Value ([pscustomobject]@{ schema_version = 2; entries = @($cachedEntry) })
+        $cacheHit = (& $scriptPath -Action capabilities -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash | ConvertFrom-Json)
+        $cachedEntry.version = '0.0.1'
+        $cachedEntry.executable_sha256 = '0' * 64
+        Write-WorkforceState -Path $capabilityCachePath -Value ([pscustomobject]@{ schema_version = 2; entries = @($cachedEntry) })
+        $hashRefresh = (& $scriptPath -Action capabilities -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash | ConvertFrom-Json)
+        $refreshedState = Read-WorkforceState -Path $capabilityCachePath -DefaultValue $null -RestoreFromBackup
+        $expiredEntry = @($refreshedState.entries | Select-Object -First 1)[0]
+        $expiredEntry.version = '0.0.1'
+        $expiredEntry.expires_at = [DateTimeOffset]::UtcNow.AddMinutes(-1).ToString('o')
+        Write-WorkforceState -Path $capabilityCachePath -Value ([pscustomobject]@{ schema_version = 2; entries = @($expiredEntry) })
+        $ttlRefresh = (& $scriptPath -Action capabilities -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash | ConvertFrom-Json)
+        $validEntry = @((Read-WorkforceState -Path $capabilityCachePath -DefaultValue $null -RestoreFromBackup).entries | Select-Object -First 1)[0]
+        $validEntry.version = '9.9.9'
+        $validEntry.expires_at = [DateTimeOffset]::UtcNow.AddHours(1).ToString('o')
+        Write-WorkforceState -Path $capabilityCachePath -Value ([pscustomobject]@{ schema_version = 2; entries = @($validEntry) })
+        $forcedRefresh = (& $scriptPath -Action capabilities -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -RefreshCapabilities | ConvertFrom-Json)
+        if ($cacheHit.claude_version -ne '9.9.9' -or $hashRefresh.claude_version -ne '2.1.208' -or $ttlRefresh.claude_version -ne '2.1.208' -or $forcedRefresh.claude_version -ne '2.1.208') {
+            throw 'Capability cache did not honor hit, executable hash, TTL, and explicit refresh boundaries.'
+        }
+        $result.capability_cache_ttl_hash = $true
         $backgroundBudgetRejected = $false
         try {
             & $scriptPath -Action start -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'guard probe' -MaxTurns 1 -MaxBudgetUsd 1 | Out-Null
         }
         catch {
-            $expectedMessage = 'Start uses Claude background mode, which does not support per-run turn, SDK budget, or provider-budget thresholds. Use run or Claude Code MCP when bounded accounting is required.'
+            $expectedMessage = 'Start background mode does not support per-run turn or hard SDK budget caps. Advisory provider budgets may be evaluated at later reply/finalization boundaries.'
             if ($_.Exception.Message -ceq $expectedMessage) {
                 $backgroundBudgetRejected = $true
             }
@@ -591,6 +702,18 @@ exit 1
             throw "NoTools + ContextProfile full did not force minimal profile (got: $noToolsFullResult.context_profile)."
         }
         $result.no_tools_full_forced_minimal = $true
+
+        $zeroTurnsResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'max turns zero probe' -NoTools -MaxTurns 0 -ProviderBudgetCny ([decimal]'0.01') -Model 'deepseek-v4-flash[1m]' -ForceNewDispatch | ConvertFrom-Json)
+        if ($zeroTurnsResult.result -ne 'MAX_TURNS_PRESENT=False') {
+            throw 'MaxTurns=0 was forwarded to Claude Code instead of being omitted.'
+        }
+        $result.max_turns_zero_omitted = $true
+
+        $multiResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'multi result probe' -NoTools -MaxTurns 1 -ProviderBudgetCny ([decimal]'0.01') -Model 'deepseek-v4-flash[1m]' -ForceNewDispatch | ConvertFrom-Json)
+        if ($multiResult.result -ne 'SELECTED_RESULT' -or $multiResult.session_id -ne '82828282-8282-4282-8282-828282828282') {
+            throw 'Result parser selected a diagnostic JSON object instead of the terminal result.'
+        }
+        $result.result_multi_json_selected = $true
 
         $unredactedProbePattern = 'BEGIN.*PRIVATE.*KEY|MIIE-fake|ghp_|' + [regex]::Escape(('AK' + 'IAIOSFODNN7EXAMPLE'))
         if ($startResult.launch -match $unredactedProbePattern) {
@@ -695,6 +818,7 @@ exit 1
             }
         }
 
+        Write-TestStage -Name 'retention-complete'
         # Unknown model not rejected by parameter binding (model validation is pattern-based)
         $unknownModelRejected = $false
         try {
@@ -718,16 +842,10 @@ exit 1
         }
         $result.unknown_model_pricing_null = $true
 
-        # Unknown provider pricing cannot silently pretend that a provider soft budget is active.
-        $unpricedSoftBudgetRejected = $false
-        try {
-            & $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'unknown model soft budget probe' -NoTools -MaxTurns 1 -ProviderBudget 1 -Model 'gpt-5' | Out-Null
-        }
-        catch {
-            $unpricedSoftBudgetRejected = $_.Exception.Message -match 'no audited pricing'
-        }
-        if (-not $unpricedSoftBudgetRejected) {
-            throw 'Unknown model accepted an ineffective provider-only soft budget without acknowledgement.'
+        # Advisory budgets remain non-blocking when pricing is unavailable, but must report no conclusion.
+        $unpricedSoftBudgetResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'unknown model soft budget probe' -NoTools -MaxTurns 1 -ProviderBudget 1 -Model 'gpt-5' | ConvertFrom-Json)
+        if ($null -ne $unpricedSoftBudgetResult.provider_cost_estimate -or $null -ne $unpricedSoftBudgetResult.provider_cost_exceeds_budget -or $unpricedSoftBudgetResult.provider_cost_note -notmatch 'No audited') {
+            throw 'Unknown-model advisory budget reported a fabricated estimate or enforcement conclusion.'
         }
         $result.unknown_model_soft_budget_guard = $true
 
@@ -737,6 +855,7 @@ exit 1
         }
         $result.unknown_model_explicit_override = $true
 
+        Write-TestStage -Name 'pricing-complete'
         # Namespace override via WORKFORCE_NAMESPACE env var
         $previousNamespace = $env:WORKFORCE_NAMESPACE
         try {
@@ -783,6 +902,7 @@ exit 1
             $result.cmd_shim = $true
         }
 
+        Write-TestStage -Name 'namespace-and-shim-complete'
         $listResult = (& $scriptPath -Action list -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -All -AllThreads | ConvertFrom-Json)
         if ($listResult.count -lt 1 -or 'worker-reply' -notin @($listResult.workers.id)) {
             throw 'Successful worker list output was not returned.'
@@ -823,27 +943,60 @@ exit 1
                 throw 'Log-prefixed pretty roster was not parsed correctly.'
             }
             $result.roster_log_prefix_pretty_parsed = $true
+
+            $env:CF_TEST_ROSTER_FORMAT = 'ansi-multi-bracket'
+            $complexList = & $scriptPath -Action list -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -All -AllThreads | ConvertFrom-Json
+            if ($complexList.count -ne 1 -or $complexList.workers[0].id -ne 'complex-a' -or $complexList.workers[0].name -ne 'bracket ] worker') {
+                throw 'ANSI/multi-JSON roster with a closing bracket inside a string was not parsed correctly.'
+            }
+            $result.roster_ansi_multi_bracket_parsed = $true
+
+            $env:CF_TEST_ROSTER_FORMAT = 'trailing-logs'
+            $trailingRejected = $false
+            try {
+                & $scriptPath -Action list -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -All -AllThreads | Out-Null
+            }
+            catch {
+                $trailingRejected = $_.Exception.Message -match 'worker roster JSON could not be parsed'
+            }
+            if (-not $trailingRejected) {
+                throw 'Roster parser accepted non-empty trailing logs after the JSON array.'
+            }
+            $result.roster_trailing_logs_rejected = $true
         }
         finally {
             $env:CF_TEST_ROSTER_FORMAT = $previousRosterFormat
         }
 
-        $replyModelRejected = $false
+        Write-TestStage -Name 'roster-parser-complete'
+        $previousAttachMarker = $env:CF_TEST_ATTACH_MARKER
+        $attachMarker = Join-Path ([IO.Path]::GetTempPath()) "claude-workforce-attach-$([guid]::NewGuid().ToString('N')).txt"
         try {
-            & $scriptPath -Action reply -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'worker-model-guard' -Prompt 'guard probe' -MaxTurns 1 -ProviderBudgetCny ([decimal]'0.01') | Out-Null
-        }
-        catch {
-            if ($_.Exception.Message -ceq 'Reply requires an explicit -Model so the resumed task is routed deliberately and provider cost uses the correct rate.') {
-                $replyModelRejected = $true
+            $env:CF_TEST_ATTACH_MARKER = $attachMarker
+            & $scriptPath -Action attach -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'cx-manual-reply-test' -AllThreads | Out-Null
+            if (-not (Test-Path -LiteralPath $attachMarker -PathType Leaf) -or (Get-Content -LiteralPath $attachMarker -Raw -Encoding UTF8).Trim() -ne 'worker-reply') {
+                throw 'Attach did not invoke Claude Code with the canonical roster worker ID.'
             }
-            else {
-                throw
-            }
+            $result.attach_canonical_id = $true
         }
-        if (-not $replyModelRejected) {
-            throw 'Reply silently accepted the default model instead of requiring deliberate routing.'
+        finally {
+            $env:CF_TEST_ATTACH_MARKER = $previousAttachMarker
+            Remove-Item -LiteralPath $attachMarker -Force -ErrorAction SilentlyContinue
+        }
+        $replyMetadataManifest = New-WorkforceManifest -Namespace 'cx-manual' -CwdFingerprint 'reply-metadata-cwd' -Role worker -TaskFingerprint 'reply-metadata-task' -WorkerId 'worker-reply' -WorkerName 'cx-manual-reply-test' -SessionId '44444444-4444-4444-8444-444444444444'
+        $replyMetadataManifest.status = 'completed'
+        $replyMetadataManifest.cleanup_status = 'complete'
+        $replyMetadataManifest.result = [pscustomobject]@{ is_error = $false }
+        foreach ($entry in @{ model = 'deepseek-v4-flash[1m]'; effort = 'low'; context_profile = 'minimal'; trust_profile = 'strict'; budget_policy = 'advisory' }.GetEnumerator()) {
+            Set-WorkforceObjectProperty -InputObject $replyMetadataManifest -Name $entry.Key -Value $entry.Value
+        }
+        Save-WorkforceManifest -StateRoot $stateRoot -Manifest $replyMetadataManifest | Out-Null
+        $inheritedReply = (& $scriptPath -Action reply -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'worker-reply' -AllThreads -Prompt 'metadata inheritance probe' -NoTools -MaxTurns 1 -ProviderBudgetCny ([decimal]'0.01') -AllowLegacySession | ConvertFrom-Json)
+        if ($inheritedReply.model -ne 'deepseek-v4-flash[1m]' -or $inheritedReply.effort -ne 'low' -or $inheritedReply.trust_profile -ne 'strict' -or $inheritedReply.budget_policy -ne 'advisory') {
+            throw 'Reply did not inherit saved model, effort, trust, and budget metadata.'
         }
         $result.reply_model_guard = $true
+        $result.reply_effort_guard = $true
 
         $replyWriteModeRejected = $false
         try {
@@ -862,29 +1015,15 @@ exit 1
         }
         $result.reply_write_mode_guard = $true
 
-        $replyEffortRejected = $false
-        try {
-            & $scriptPath -Action reply -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'worker-reply' -AllThreads -Prompt 'effort guard probe' -MaxTurns 1 -ProviderBudgetCny ([decimal]'0.01') -Model 'deepseek-v4-flash[1m]' -AllowLegacySession | Out-Null
-        }
-        catch {
-            if ($_.Exception.Message -ceq 'Reply requires an explicit -Effort so the resumed task uses a deliberate reasoning level rather than silently defaulting to medium.') {
-                $replyEffortRejected = $true
-            }
-            else {
-                throw
-            }
-        }
-        if (-not $replyEffortRejected) {
-            throw 'Reply silently accepted the default Effort instead of requiring deliberate routing.'
-        }
-        $result.reply_effort_guard = $true
-
         $legacyRejected = $false
         try {
             & $scriptPath -Action reply -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'worker-reply' -AllThreads -Prompt 'legacy provenance probe' -NoTools -MaxTurns 1 -MaxBudgetUsd 1 -Model 'deepseek-v4-flash[1m]' -Effort low | Out-Null
         }
         catch {
             $legacyRejected = $_.Exception.Message -match 'predates workforce provenance tracking'
+            if (-not $legacyRejected) {
+                throw
+            }
         }
         if (-not $legacyRejected) {
             throw 'Legacy worker resumed without an explicit provenance override.'
@@ -899,23 +1038,32 @@ exit 1
         }
         $result.reply_success_output = $true
 
+        $timeoutResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'timeout monitored probe' -NoTools -MaxTurns 0 -ProviderBudgetCny ([decimal]'0.05') -Model 'deepseek-v4-flash[1m]' -HardTimeoutSeconds 1 -StartupTimeoutSeconds 3 -IdleTimeoutSeconds 3 -ProcessTimeoutSeconds 15 -ForceNewDispatch | ConvertFrom-Json)
+        $timeoutSessionGuid = [guid]::Empty
+        if ($timeoutResult.original_result_subtype -ne 'workforce-timeout-hard' -or -not $timeoutResult.auto_finalize_attempted -or -not $timeoutResult.resume_used -or -not [guid]::TryParse([string]$timeoutResult.session_id, [ref]$timeoutSessionGuid) -or $timeoutResult.result -ne 'FINALIZED_AFTER_TIMEOUT') {
+            throw 'A monitored timeout with a recoverable session did not use same-session finalize.'
+        }
+        $result.timeout_same_session_finalize = $true
+
+        Write-TestStage -Name 'reply-guards-complete'
         $errorResult = (& $scriptPath -Action run -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Cwd (Split-Path -Parent $PSScriptRoot) -Prompt 'error recovery probe' -NoTools -MaxTurns 2 -MaxBudgetUsd 1 -Model 'deepseek-v4-flash[1m]' -IncludeSdkCostEstimate | ConvertFrom-Json)
-        if ($errorResult.process_exit_code -ne 1 -or $errorResult.result_subtype -ne 'error_max_turns' -or -not $errorResult.is_error) {
-            throw 'Nonzero Claude result metadata was not preserved.'
+        if ($errorResult.original_process_exit_code -ne 1 -or $errorResult.original_result_subtype -ne 'error_max_turns' -or -not $errorResult.original_is_error -or
+            $errorResult.process_exit_code -ne 0 -or $errorResult.result_subtype -ne 'success' -or $errorResult.is_error -or -not $errorResult.auto_finalize_attempted -or -not $errorResult.resume_used -or $errorResult.session_id -ne '11111111-1111-4111-8111-111111111111') {
+            throw 'Limit failure evidence or same-session finalize result was not preserved.'
         }
-        if ($errorResult.total_cost_usd -ne 0.25 -or $errorResult.usage.input_tokens -ne 100 -or $errorResult.usage.cache_read_input_tokens -ne 30) {
-            throw 'Nonzero Claude usage or cost metadata was not preserved.'
+        if ($errorResult.original_usage.input_tokens -ne 100 -or $errorResult.original_usage.cache_read_input_tokens -ne 30 -or $errorResult.result -ne 'FINALIZED_FROM_EXISTING_CONTEXT') {
+            throw 'Original limit usage or finalized output was not preserved.'
         }
-        if ($errorResult.sdk_total_cost_usd -ne 0.25 -or [decimal]$errorResult.provider_cost_estimate_cny -ne [decimal]'0.000201') {
+        if ($errorResult.sdk_total_cost_usd -ne 0.01 -or [decimal]$errorResult.provider_cost_estimate_cny -ne [decimal]'0.00002') {
             throw 'Provider-aware cost fields were not calculated from usage correctly.'
         }
         if ($errorResult.provider_pricing.currency -ne 'CNY' -or $errorResult.provider_pricing.cache_miss_per_million -ne 1) {
             throw 'Provider pricing metadata is missing or incorrect.'
         }
-        if ($errorResult.provider_billing_tokens.cache_miss -ne 120 -or $errorResult.provider_billing_tokens.cache_hit -ne 30 -or $errorResult.provider_billing_tokens.output -ne 40) {
+        if ($errorResult.provider_billing_tokens.cache_miss -ne 0 -or $errorResult.provider_billing_tokens.cache_hit -ne 20 -or $errorResult.provider_billing_tokens.output -ne 10) {
             throw 'Provider billing token buckets were not derived correctly.'
         }
-        if ([decimal]$errorResult.provider_cost_components_cny.cache_miss -ne [decimal]'0.00012' -or [decimal]$errorResult.provider_cost_components_cny.cache_hit -ne [decimal]'0.0000006' -or [decimal]$errorResult.provider_cost_components_cny.output -ne [decimal]'0.00008') {
+        if ([decimal]$errorResult.provider_cost_components_cny.cache_miss -ne 0 -or [decimal]$errorResult.provider_cost_components_cny.cache_hit -ne [decimal]'0.0000004' -or [decimal]$errorResult.provider_cost_components_cny.output -ne [decimal]'0.00002') {
             throw 'Provider cost components were not calculated correctly.'
         }
         $result.provider_cost_estimate = $true
@@ -992,6 +1140,7 @@ exit 1
             $env:CF_TEST_MCP_MODE = $previousMcpMode
         }
 
+        Write-TestStage -Name 'recovery-complete'
         $stopResult = (& $scriptPath -Action stop -ClaudeExecutable $fakeClaude -ExpectedClaudeSha256 $fakeHash -Id 'worker-reply' -AllThreads -GracefulShutdownSeconds 0 -PortReleaseTimeoutSeconds 0 | ConvertFrom-Json)
         if (-not $stopResult.terminal_state_verified -or -not $stopResult.worker_stopped -or
             $stopResult.owned_processes_remaining -ne 0 -or $stopResult.owned_ports_remaining -ne 0 -or
@@ -999,10 +1148,12 @@ exit 1
             throw 'Stop did not verify terminal state and owned resource cleanup.'
         }
         $result.verified_stop = $true
+        Write-TestStage -Name 'fake-runtime-complete'
     }
     finally {
         $fakeRoster = Join-Path ([IO.Path]::GetTempPath()) ((Split-Path -LeafBase $fakeClaude) + '-roster.json')
         Remove-Item -LiteralPath $fakeRoster -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath "$fakeRoster.timeout-session" -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $fakeClaude -Force -ErrorAction SilentlyContinue
         if ($fakeCmd) {
             Remove-Item -LiteralPath $fakeCmd -Force -ErrorAction SilentlyContinue
@@ -1017,7 +1168,7 @@ exit 1
     if (-not $capabilities.version_supported -or $capabilities.version_degraded -or -not $capabilities.has_background -or -not $capabilities.has_json_list -or -not $capabilities.has_output_format) {
         throw 'Claude Code runtime does not satisfy workforce requirements.'
     }
-    if ($capabilities.minimum_supported -ne '2.1.207' -or $capabilities.degraded_range -ne '2.1.200–2.1.206') {
+    if ($capabilities.minimum_supported -ne '2.1.208' -or $capabilities.degraded_range -ne '2.1.200–2.1.207') {
         throw 'Version support metadata does not reflect the documented supported and degraded ranges.'
     }
     if ($capabilities.bypass_allowed) {

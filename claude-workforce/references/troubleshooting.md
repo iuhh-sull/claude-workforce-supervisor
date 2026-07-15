@@ -8,10 +8,12 @@ Run `reconcile` and inspect `dispatch_reason`:
 - `completed-manifest-available`: reuse the stored result or pass `-ForceNewDispatch` only when repetition is intentional.
 - `worker-capacity-exhausted`: wait, clean terminal workers, or use a justified independent burst.
 - `api-circuit-open`: stop new dispatch and run `doctor`; wait for half-open probing.
+- `cleanup-incomplete`: run `reap`, then inspect broker resources and leases; do not force a new conflicting dispatch.
+- `manifest-corrupt`: stop dispatch and restore a verified backup or repair through the supported migration path.
 
 ## Cleanup is incomplete
 
-Run `resources` and `ports`. A process is never force-stopped unless PID, start time, executable, session, and ownership fingerprint match. `pid-reused`, `session-mismatch`, `executable-mismatch`, and `missing-ownership-fingerprint` are safety stops, not reasons to kill broadly.
+Run `doctor`, `resources`, `ports`, then `reap`. A process is never force-stopped unless the broker HMAC, key ACL, Manifest/session, PID, start time, executable, descendant chain, and listener PID all validate. `signature-invalid`, `broker-key-acl-unverified`, `pid-reused`, `session-mismatch`, `executable-mismatch`, and `listener-pid-mismatch` are safety stops, not reasons to kill broadly.
 
 Do not end all `node`, `python`, `claude`, or browser processes. Do not kill from a port number alone.
 
@@ -26,3 +28,11 @@ Separate HTTP/SSE from stdio. Check registered endpoint/port ownership before a 
 ## Daemon environment drift
 
 Run `doctor`. If `environment_changed` is true after an intentional provider, endpoint, PATH, proxy, Claude, MCP, or TLS change, use `daemon-restart-keep-workers`. On Windows, never use `taskkill` unless Claude CLI returned the exact supervisor PID and the operator confirmed it.
+
+## State migration
+
+If `doctor.migration_required` is true, run `migrate` and retain its `backup_path`. Use `rollback-migration -MigrationBackupPath <path>` only with that reviewed path. Migration and rollback are serialized with the global state lock; do not manually merge `resource-index.json` into schema-v2 Manifests.
+
+## Timeout or partial output
+
+Inspect which of startup, idle, or hard timeout fired and whether same-session finalize ran. Preserve stdout/stderr, usage, session ID, and cleanup result. Resume the same session when safe; do not create a replacement session that repeats reads or side effects.

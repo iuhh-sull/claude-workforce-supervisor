@@ -6,13 +6,17 @@ Claude Workforce lets Codex manage background Claude Code workers through the of
 
 This unofficial Codex skill wraps the official `agents` subcommand. It is intended for research, code review, and background work completed in stages.
 
+> Status: beta. The state, broker, migration, timeout, and permission architecture is covered by deterministic tests, but real-host behavior still depends on the installed Claude Code/provider path. Run the manual opt-in host workflow before treating a release as production-ready.
+
+Requirements: Windows, PowerShell 7, and Claude Code `2.1.208` or newer. Older versions are rejected even if some capability probes appear to pass.
+
 ## Install
 
 ```powershell
 pwsh -NoProfile -File Install.ps1
 ```
 
-First install doesn't need `-Force`. Add `-Force` only to overwrite an existing installation; the script backs up the old directory first.
+First install doesn't need `-Force`. Add `-Force` only to replace an existing installation; the script backs up the old skill directory first. Installation also runs idempotent schema-v2 state migration, creates a separate state backup when needed, and returns a `rollback_command`. Use `-SkipStateMigration` only when migration will be performed and reviewed separately; the installer never copies over the workforce state root.
 
 After install you can create a private config at `~/.codex/claude-workforce.local.psd1`. The recommended active keys are:
 
@@ -39,7 +43,7 @@ $workforce = Join-Path $HOME '.codex\skills\claude-workforce\scripts\claude-work
 pwsh -NoProfile -File $workforce -Action capabilities
 ```
 
-Use `run` for one-off work. Bound execution with `-MaxTurns` plus either an audited provider soft threshold (`-ProviderBudget`) or the SDK hard cap (`-MaxBudgetUsd`). The examples below use the bundled DeepSeek adapter; substitute your own model and budget policy as needed:
+Use `run` for one-off work. Choose `-BudgetPolicy none`, `advisory` (default), or `hard`. A positive `-MaxTurns` is a requested turn boundary; `-MaxTurns 0` omits `--max-turns` entirely. The examples below use the bundled DeepSeek adapter; substitute your own model and budget policy as needed:
 
 ```powershell
 # Text or numeric judgment: minimal context, no tools, no retained session after success
@@ -78,7 +82,7 @@ For status, log, reply, stop, and remove commands, see [SKILL.md](./claude-workf
 
 ## Cost and context profiles
 
-`auto` selects `minimal` for no-tool work and `project` otherwise. The same default applies to `reply`. `minimal` disables hooks, skills, plugins, MCP, memory, and CLAUDE.md. `user` loads user configuration without MCP. `project` loads user and project rules without MCP. Only `full` inherits all configured MCP servers and local settings.
+`auto` selects `minimal` for no-tool work and `project` otherwise. The same default applies to `reply`. `minimal` disables rules, skills, plugins, MCP, memory, and CLAUDE.md. `user` loads user configuration without MCP. `project` loads user and project rules without MCP. Only `full` inherits all configured MCP servers and local settings. Hooks are disabled in every profile by default; `-AllowHooks` removes only the session-level disable key and never weakens `-NoTools`.
 
 A full tool environment can inject tens of thousands of tokens before the first task sentence. Use `full` only when the task actually needs MCP. With a custom `ANTHROPIC_BASE_URL`, Claude Code may not enable Tool Search automatically; set `EnableToolSearch = $true` only after a real MCP call succeeds. The wrapper also caps a single MCP result at 10,000 tokens by default.
 
@@ -86,7 +90,7 @@ Do not add supervisor and worker tokens or prices together when judging quota sa
 
 With a custom endpoint, the Claude Agent SDK may estimate `total_cost_usd` from Anthropic prices even when another provider handles the request. That number is not the provider bill, so the wrapper hides it by default; add `-IncludeSdkCostEstimate` only when diagnosing the compatibility layer. For a model with an audited rate adapter, normal output derives billing-token buckets, component costs, currency, and a provider estimate from returned `usage`. Unknown models remain usable, but no provider estimate is invented.
 
-`-ProviderBudget` is a post-run soft threshold for accounting and alerts; `-ProviderBudgetCny` remains its backward-compatible name. `-MaxBudgetUsd` is an SDK-internal hard stop and may not match a custom provider's bill. Official background `--bg` supports neither limit, so `start` does not claim a hard cap. `run` and `reply` require finite `-MaxTurns` plus one budget boundary. A provider-only threshold requires an audited model rate unless `-AllowUnpricedModel` explicitly acknowledges that no provider estimate can be enforced.
+`BudgetPolicy none` reports usage without a budget decision. `advisory` may compare the completed run with `-ProviderBudget`/`-ProviderBudgetCny` and fresh audited pricing, but never interrupts the active invocation. `hard` requires `-MaxBudgetUsd` and passes the SDK-internal hard cap; with a custom provider it is not the provider invoice. Official background `--bg` supports neither per-run cap, so `start` does not claim one. Unknown or stale pricing produces an unavailable/indeterminate provider decision rather than an invented cost.
 
 `reply` also requires explicit `-Model` and `-Effort` values for every resumed task. Native print-mode replies are inspect-only; use the Claude Code MCP path when a resumed task needs interactive write approval. After `start`, the wrapper checks the supervisor roster and returns `roster_verified`, `roster_state`, `roster_cwd_match`, and `roster_session_id`; a roster-query failure is reported without pretending verification succeeded.
 
@@ -102,26 +106,15 @@ Use a fast/low-cost model with low or medium effort for retrieval, extraction, f
 
 Route by error cost and expected rework, not only by input size. Higher effort spends more thinking tokens, so routine follow-up work should not inherit high/max from an earlier phase. Typical delivery estimates are 20–60 seconds for flash/low, 1–3 minutes for flash/medium, 3–8 minutes for pro/high, and 5–15 minutes for pro/max or multi-tool work. Check status near the expected milestone rather than polling continuously, except for permission requests or near-terminal work.
 
-After a failed CC call, review model, effort, context scope, tool turns, budget, and final-output headroom separately. Do not default to Pro/max when a mechanical read exceeded its turn envelope; slice or compress the input and resume the same session first. `MaxTurns` should cover the expected tool calls plus at least two finalization turns; multi-file evidence gathering commonly starts at 8–20 turns, with 1.5–2× that allowance during testing. For explicitly approved, non-sensitive summaries, usage data, error-log excerpts, and project files, context-mode may be temporarily allowed by exact tool name and path, but that grant does not extend to credentials, drive-wide scans, arbitrary commands, writes, or exfiltration. Synchronous native CLI capture accepts `-ProcessTimeoutSeconds` from 15 to 3600 seconds (default 1800) and requests termination of only the process tree it started. A detached descendant may survive, so check process and provider state before retrying.
+After a failed CC call, review model, effort, context scope, tool turns, budget, and final-output headroom separately. Do not default to Pro/max when a mechanical read exceeded its turn envelope; slice or compress the input and resume the same session first. A positive `MaxTurns` should cover the expected tool calls plus at least two finalization turns. `StartupTimeoutSeconds` covers launch-to-first-output, `IdleTimeoutSeconds` covers continuous inactivity after startup, and `HardTimeoutSeconds` is the absolute wall clock (`0` disables it). `ProcessTimeoutSeconds` is only a compatibility alias. Timeout preserves partial stdout/stderr, attempts one same-session no-tools finalize, and performs broker-verified cleanup.
 
 ## Permissions
 
-`new-workforce-session-profile.ps1` builds temporary, session-scoped settings shared by the MCP and Agent View paths. It never writes to `~/.claude/settings.json`, so a normal interactive `claude` session keeps the user's own model and permission defaults.
+`new-workforce-session-profile.ps1` builds temporary, session-scoped settings shared by the MCP and Agent View paths. It never writes to `~/.claude/settings.json`, so a normal interactive `claude` session keeps the user's own defaults.
 
-**Permission layers in this profile:**
+`-TrustProfile` supports `strict`, `balanced` (default), and `delegated`. Strict keeps project writes and common commands reviewable. Balanced allows current-worktree writes plus bounded read-only Git/test commands. Delegated adds common formatter, type-check, and static-check commands. None of them broadly allow arbitrary Shell, sensitive reads, WebFetch, local-data egress, install, authentication, destructive commands, commit, push, publishing, or deployment.
 
-| Layer | Meaning | Example |
-|-------|---------|---------|
-| **tools** | Capability exists in the runtime. | `Read`, `Bash`, `Agent` are all present. |
-| **allow** | Pre-authorized — runs without per-invocation approval. | `Read`, `Glob`, `Grep`, `WebSearch`, `Plan`. |
-| **ask** | Per-invocation review via `canUseTool` → Codex. | `Bash`, `Edit`, `Write`, `WebFetch`, `Agent`, `Task`. |
-| **deny** | Hard block — cannot be used regardless of other rules. | Kept empty; truly unacceptable actions are refused by Codex. |
-
-Sensitive-path Read rules (`.env`, `auth.json`, `settings.json`, private keys) are placed in **ask** with higher priority than the broad `Read` **allow**, so they still trigger per-invocation review even though `Read` is pre-authorized.
-
-This profile does not use `bypassPermissions`, `acceptEdits`, `dontAsk`, or any form of skip-permissions. Every write, shell command, web fetch target, and nested agent remains reviewable.
-
-Read, Glob, Grep, WebSearch, and Plan are pre-authorized. Shell commands, Edit, Write, NotebookEdit, each WebFetch target, Agent, and side-effecting MCP tools are surfaced through the permission proxy. Codex may approve a public URL or a clearly read-only shell/Git inspection directly; writes, outbound local data, authentication, installation, publishing, and deployment require an input-specific decision.
+All profiles emit `disableAllHooks: true` by default. `-AllowHooks` removes that session key but does not assert that inherited hooks are safe or override managed settings. `-NoTools` always disables hooks and tools. Sensitive-path Read, worktree-external writes, WebFetch targets, nested Agent/Task, and side-effecting MCP tools remain input-specific decisions; the project never uses bypass/skip-permission modes.
 
 ## Extending to a new provider
 
@@ -141,7 +134,9 @@ Every new persistent worker name includes a workforce-profile version and a fing
 
 ## Resource lifecycle and connectivity
 
-Every dispatch runs `reconcile` before acquisition. The wrapper fingerprints namespace/cwd/role/task, prevents duplicate work, reuses completed manifests, checks provider/model circuit state, and applies soft concurrency ceilings:
+Schema-v2 Manifest files are the sole authoritative lifecycle state and are written only by the supervisor under a mutex, atomic replace, backup, revision CAS, and transition checks. Worker reports are untrusted audit input and cannot register resources or change ownership. Processes, ports, and MCP endpoints become trusted only through the capability-token broker; persisted records and leases use HMAC. The token is never persisted or returned.
+
+Every dispatch runs reaper/reconcile before acquisition. Reaper idempotently converges terminal/stale workers and retries eligible cleanup. Reconcile prevents duplicate work, blocks corrupt or `cleanup-incomplete` state, checks provider/model circuit state, and applies soft concurrency ceilings:
 
 | Level | Stable active | Burst | Nested agents |
 |---|---:|---:|---:|
@@ -156,13 +151,15 @@ pwsh -NoProfile -File $workforce -Action reconcile -Cwd $project -Role researche
 pwsh -NoProfile -File $workforce -Action resources
 pwsh -NoProfile -File $workforce -Action ports
 pwsh -NoProfile -File $workforce -Action doctor -Cwd $project
+pwsh -NoProfile -File $workforce -Action reap
+pwsh -NoProfile -File $workforce -Action migrate
 pwsh -NoProfile -File $workforce -Action daemon-restart-keep-workers
 pwsh -NoProfile -File $workforce -Action stop -Id '<worker-id>' -GracefulShutdownSeconds 10 -PortReleaseTimeoutSeconds 15
 ```
 
-Retryable provider failures perform at most one same-session recovery and retain partial output. Authentication, invalid-model, TLS-validation, DNS-configuration, and unsupported-endpoint failures never auto-retry. Circuit-open state freezes new dispatch. HTTP/SSE and stdio MCP recovery use distinct policies and startup/idle/tool timeouts.
+Retryable provider failures perform at most one same-session recovery and retain partial output. Authentication, invalid-model, TLS-validation, DNS-configuration, and unsupported-endpoint failures never auto-retry. Circuit-open state freezes new dispatch. Cleanup never trusts a worker report or kills by name/port alone: force cleanup requires broker HMAC, safe key ACL, Manifest/session binding, PID/start-time/executable/descendant identity, and listener PID. Any failed proof remains `cleanup-incomplete`.
 
-State lives under `~/.codex/claude-workforce/` by default. Output includes `cleanup_status`, remaining owned process/port counts, retry counts, reuse decisions, and concurrency reduction. See the focused references under `claude-workforce/references/`.
+State lives under `~/.codex/claude-workforce/` by default. Every lifecycle result includes `cleanup_status`, owned process/port counts, retry/finalize and reuse decisions. Legacy state migrates with a rollback backup; `doctor` reports migration, state lock/corruption, broker key/ACL, stale/cleanup, port, pricing and environment status. See the focused references under `claude-workforce/references/`.
 
 ## Windows note
 
@@ -185,12 +182,22 @@ claude-workforce/
   agents/openai.yaml       # OpenAI-compatible agent definition
   scripts/
     claude-workforce.ps1   # Core wrapper
-    workforce-lifecycle.ps1 # State, leases, circuits, ownership, cleanup
     new-workforce-session-profile.ps1 # Session-only MCP/worker settings
-  references/              # Lifecycle, connectivity, ports, levels, operations, troubleshooting
+    workforce-lifecycle.ps1 # Authoritative Manifest state machine
+    workforce-state.ps1    # Mutex, atomic JSON, backup, CAS
+    workforce-resource-broker.ps1 # Capability/HMAC resource broker
+    workforce-reaper.ps1   # Terminal/stale postflight convergence
+    workforce-timeouts.ps1 # Startup/idle/hard process monitor
+  config/provider-pricing.psd1 # Audited provider rates
+  references/              # Permissions, budgets/timeouts, lifecycle, recovery, operations
 Install.ps1                # Install script
 tests/
-  Test-ClaudeWorkforce.ps1 # Parse check + runtime permission probe
+  Test-ClaudeWorkforce.ps1 # Portable fake-runtime suite
+  Test-WorkforceRemediation.ps1 # Concurrency/security/timeout regression suite
+  helpers/                 # Deterministic process/state fixtures
+.github/workflows/
+  test.yml                 # Windows unit/remediation CI
+  host-integration.yml     # Manual opt-in real-host CI
 README.md                  # This file
 README.zh-CN.md            # Chinese translation
 SECURITY.md                # Security policy

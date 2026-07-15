@@ -1,15 +1,20 @@
 name: Test Claude Workforce
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
     paths:
+      - 'Install.ps1'
       - 'claude-workforce/**'
       - 'tests/**'
       - '.github/workflows/test.yml'
   pull_request:
     branches: [main]
     paths:
+      - 'Install.ps1'
       - 'claude-workforce/**'
       - 'tests/**'
       - '.github/workflows/test.yml'
@@ -30,21 +35,37 @@ jobs:
 
       - name: Parse all scripts
         run: |
-          $paths = @(
-            'claude-workforce/scripts/claude-workforce.ps1',
-            'claude-workforce/scripts/new-workforce-session-profile.ps1',
-            'Install.ps1'
-          )
-          foreach ($p in $paths) {
-            $errs = $null
-            [void][Management.Automation.Language.Parser]::ParseFile($p, [ref]$null, [ref]$errs)
-            if ($errs.Count -gt 0) { throw "$p : $($errs[0].Message)" }
+          $paths = @(Get-ChildItem -LiteralPath . -Filter '*.ps1' -File -Recurse | Sort-Object FullName)
+          if ($paths.Count -eq 0) { throw 'No PowerShell scripts were found.' }
+          foreach ($path in $paths) {
+            $tokens = $null
+            $errors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile($path.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) { throw "$($path.FullName) : $($errors[0].Message)" }
           }
-          Write-Host 'All scripts parse cleanly.'
+          Write-Host "$($paths.Count) scripts parse cleanly."
 
-      - name: Run unit test suite
-        run: ./tests/Test-ClaudeWorkforce.ps1 -SkipHostRuntime
+      - name: Run portable fake-runtime and concurrency suite
+        run: |
+          New-Item -ItemType Directory -Path '.test-results' -Force | Out-Null
+          ./tests/Test-ClaudeWorkforce.ps1 -SkipHostRuntime |
+            Tee-Object -FilePath '.test-results/fake-runtime.json'
         timeout-minutes: 5
+
+      - name: Run full remediation suite
+        run: |
+          ./tests/Test-WorkforceRemediation.ps1 |
+            Tee-Object -FilePath '.test-results/full-remediation.json'
+        timeout-minutes: 10
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-workforce-test-results-${{ github.run_attempt }}
+          path: .test-results/*.json
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Verify git diff is clean (no whitespace errors)
         run: git diff --check

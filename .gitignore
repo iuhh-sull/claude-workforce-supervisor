@@ -16,3 +16,4 @@ credentials.*
 secrets.*
 config.toml
 *.local.*
+.planning/
